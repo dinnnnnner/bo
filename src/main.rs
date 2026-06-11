@@ -2,9 +2,9 @@ use eframe::egui;
 use serialport::{SerialPort, SerialPortType};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs,
+    fs::{self, OpenOptions},
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -17,6 +17,9 @@ const BAUD_RATE: u32 = 115_200;
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_LOG_LINES: usize = 300;
+const AUTO_LOG_DIR: &str = "logs/auto";
+const CURRENT_LOG_DIR: &str = "logs/current";
+const MAX_TEMPLATE_ITEM_REPEAT_COUNT: usize = 10_000;
 const FRAME_LEN: usize = 14;
 const FRAME_PREFIX: [u8; 2] = [0xAA, 0x55];
 const STATUS_FRAME_TYPE: u8 = 0x81;
@@ -29,14 +32,8 @@ const STANDBY_START_FRAME: &[u8] = &[0xAA, 0x55, 0x04, 0x55, 0xAA];
 const STANDBY_STOP_FRAME: &[u8] = &[0xAA, 0x55, 0x05, 0x55, 0xAA];
 const SENSOR_NAMES: [&str; 3] = ["S1", "S2", "S3"];
 const AXIS_NAMES: [&str; 3] = ["X", "Y", "Z"];
-const THRESHOLD_LABELS: [&str; 6] = [
-    "X上限",
-    "X下限",
-    "Y上限",
-    "Y下限",
-    "Z上限",
-    "Z下限",
-];
+const THRESHOLD_LABELS: [&str; 6] = ["X上限", "X下限", "Y上限", "Y下限", "Z上限", "Z下限"];
+const CUSTOM_PLAN_TEMPLATES_PATH: &str = "standby_plan_templates.txt";
 
 #[derive(Debug)]
 enum PortCommand {
@@ -322,6 +319,276 @@ impl StandbyAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StandbyTimerStage {
+    Standby,
+    Normal,
+}
+
+impl StandbyTimerStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "正常模式",
+            Self::Standby => "待机模式",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanFinishAction {
+    Normal,
+    Standby,
+    KeepLast,
+}
+
+impl PlanFinishAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "正常模式",
+            Self::Standby => "待机模式",
+            Self::KeepLast => "保持最后状态",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlanTemplateItem {
+    label: String,
+    stage: StandbyTimerStage,
+    duration: Duration,
+}
+
+impl PlanTemplateItem {
+    fn new(label: impl Into<String>, stage: StandbyTimerStage, duration: Duration) -> Self {
+        Self {
+            label: label.into(),
+            stage,
+            duration,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlanTemplate {
+    name: String,
+    items: Vec<PlanTemplateItem>,
+    finish_action: PlanFinishAction,
+    is_custom: bool,
+}
+
+impl PlanTemplate {
+    fn new(
+        name: impl Into<String>,
+        items: Vec<PlanTemplateItem>,
+        finish_action: PlanFinishAction,
+        is_custom: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            items,
+            finish_action,
+            is_custom,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScheduledModeEvent {
+    label: String,
+    stage: StandbyTimerStage,
+    duration: Duration,
+    started_at: Option<Instant>,
+}
+
+impl ScheduledModeEvent {
+    fn from_template_item(item: &PlanTemplateItem) -> Self {
+        Self {
+            label: item.label.clone(),
+            stage: item.stage,
+            duration: item.duration,
+            started_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StandbyPlanRun {
+    template_name: String,
+    queue: VecDeque<ScheduledModeEvent>,
+    current: Option<ScheduledModeEvent>,
+    finish_action: PlanFinishAction,
+    started_at: Instant,
+    completed_events: u64,
+}
+
+impl StandbyPlanRun {
+    fn from_template(template: &PlanTemplate) -> Self {
+        let queue = template
+            .items
+            .iter()
+            .map(ScheduledModeEvent::from_template_item)
+            .collect();
+        Self {
+            template_name: template.name.clone(),
+            queue,
+            current: None,
+            finish_action: template.finish_action,
+            started_at: Instant::now(),
+            completed_events: 0,
+        }
+    }
+
+    fn pending_duration(&self) -> Duration {
+        let current_remaining = self.current.as_ref().map_or(Duration::ZERO, |event| {
+            duration_remaining(
+                event.duration,
+                event
+                    .started_at
+                    .map_or(Duration::ZERO, |started| started.elapsed()),
+            )
+        });
+        self.queue
+            .iter()
+            .fold(current_remaining, |total, event| total + event.duration)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanResultStatus {
+    Idle,
+    Running,
+    Completed,
+    Interrupted,
+}
+
+impl PlanResultStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "未运行",
+            Self::Running => "统计中",
+            Self::Completed => "已完成",
+            Self::Interrupted => "已中断",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlanResultStats {
+    status: PlanResultStatus,
+    template_name: String,
+    started_at: Option<Instant>,
+    elapsed: Duration,
+    checked_frames: u64,
+    alarm_frames: u64,
+    alarm_points: u64,
+    port_axis_alarm_counts: HashMap<String, [[u64; 3]; 3]>,
+    last_alarm: String,
+}
+
+impl Default for PlanResultStats {
+    fn default() -> Self {
+        Self {
+            status: PlanResultStatus::Idle,
+            template_name: String::new(),
+            started_at: None,
+            elapsed: Duration::ZERO,
+            checked_frames: 0,
+            alarm_frames: 0,
+            alarm_points: 0,
+            port_axis_alarm_counts: HashMap::new(),
+            last_alarm: String::new(),
+        }
+    }
+}
+
+impl PlanResultStats {
+    fn start(&mut self, template_name: impl Into<String>) {
+        *self = Self {
+            status: PlanResultStatus::Running,
+            template_name: template_name.into(),
+            started_at: Some(Instant::now()),
+            ..Self::default()
+        };
+    }
+
+    fn finish(&mut self, status: PlanResultStatus) {
+        if self.status == PlanResultStatus::Running {
+            self.elapsed = self
+                .started_at
+                .map_or(Duration::ZERO, |started| started.elapsed());
+        }
+        self.status = status;
+    }
+
+    fn record_normal_frame(&mut self, port: &str, states: &[[AlarmState; 3]; 3]) {
+        if self.status != PlanResultStatus::Running {
+            return;
+        }
+
+        self.checked_frames = self.checked_frames.saturating_add(1);
+        let alarm_points = count_alarm_points(states);
+        if alarm_points == 0 {
+            return;
+        }
+
+        self.alarm_frames = self.alarm_frames.saturating_add(1);
+        self.alarm_points = self.alarm_points.saturating_add(alarm_points);
+        let port_counts = self
+            .port_axis_alarm_counts
+            .entry(port.to_string())
+            .or_default();
+        for (sensor_idx, sensor) in states.iter().enumerate() {
+            for (axis_idx, state) in sensor.iter().enumerate() {
+                if *state == AlarmState::Alarm {
+                    port_counts[sensor_idx][axis_idx] =
+                        port_counts[sensor_idx][axis_idx].saturating_add(1);
+                }
+            }
+        }
+        if let Some(summary) = alarm_summary(states) {
+            self.last_alarm = format!("{port}: {summary}");
+        }
+    }
+
+    fn sorted_port_axis_counts(&self) -> Vec<(&str, usize, usize, u64)> {
+        let mut counts = Vec::new();
+        for (port, sensor_counts) in &self.port_axis_alarm_counts {
+            for (sensor_idx, axis_counts) in sensor_counts.iter().enumerate() {
+                for (axis_idx, count) in axis_counts.iter().enumerate() {
+                    if *count > 0 {
+                        counts.push((port.as_str(), sensor_idx, axis_idx, *count));
+                    }
+                }
+            }
+        }
+        counts.sort_by(|a, b| {
+            a.0.cmp(b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        counts
+    }
+
+    fn elapsed_duration(&self) -> Duration {
+        if self.status == PlanResultStatus::Running {
+            self.started_at
+                .map_or(Duration::ZERO, |started| started.elapsed())
+        } else {
+            self.elapsed
+        }
+    }
+
+    fn result_label(&self) -> &'static str {
+        match self.status {
+            PlanResultStatus::Idle => "暂无结果",
+            PlanResultStatus::Running => "统计中",
+            PlanResultStatus::Interrupted => "已中断",
+            PlanResultStatus::Completed if self.alarm_frames == 0 => "通过",
+            PlanResultStatus::Completed => "有报警",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SensorFrame {
     port: String,
@@ -430,8 +697,27 @@ struct SerialPanelApp {
     self_test_counts: HashMap<String, u64>,
     frame_count: u64,
     standby_active: bool,
+    standby_timer_message: String,
+    standby_timer: Option<StandbyPlanRun>,
+    standby_plan_result: PlanResultStats,
+    standby_templates: Vec<PlanTemplate>,
+    selected_standby_template: usize,
+    new_template_name_input: String,
+    template_item_label_input: String,
+    template_item_hours_input: String,
+    template_item_minutes_input: String,
+    template_item_seconds_input: String,
+    template_item_stage: StandbyTimerStage,
+    template_item_repeat_count: usize,
+    template_sub_plan_items: Vec<PlanTemplateItem>,
+    template_sub_plan_repeat_count: usize,
+    plan_queue_expanded: bool,
+    template_items_expanded: bool,
+    template_sub_plan_expanded: bool,
+    template_edit_message: String,
     invalid_send_message: String,
     log_save_message: String,
+    auto_log_path: PathBuf,
     logs: VecDeque<String>,
 }
 
@@ -455,17 +741,57 @@ impl SerialPanelApp {
             self_test_counts: HashMap::new(),
             frame_count: 0,
             standby_active: false,
+            standby_timer_message: String::new(),
+            standby_timer: None,
+            standby_plan_result: PlanResultStats::default(),
+            standby_templates: load_plan_templates(),
+            selected_standby_template: 0,
+            new_template_name_input: "自定义计划".to_string(),
+            template_item_label_input: "自定义步骤".to_string(),
+            template_item_hours_input: "0".to_string(),
+            template_item_minutes_input: "10".to_string(),
+            template_item_seconds_input: "0".to_string(),
+            template_item_stage: StandbyTimerStage::Normal,
+            template_item_repeat_count: 1,
+            template_sub_plan_items: Vec::new(),
+            template_sub_plan_repeat_count: 1,
+            plan_queue_expanded: false,
+            template_items_expanded: false,
+            template_sub_plan_expanded: true,
+            template_edit_message: String::new(),
             invalid_send_message: String::new(),
             log_save_message: String::new(),
+            auto_log_path: auto_log_path(),
             logs: VecDeque::with_capacity(MAX_LOG_LINES),
         }
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if let Err(err) = self.append_auto_log(&line) {
+            self.log_save_message = format!("自动保存日志失败: {err}");
+        }
+
         if self.logs.len() >= MAX_LOG_LINES {
             let _ = self.logs.pop_front();
         }
-        self.logs.push_back(line.into());
+        self.logs.push_back(line);
+    }
+
+    fn append_auto_log(&self, line: &str) -> io::Result<()> {
+        fs::create_dir_all(AUTO_LOG_DIR)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.auto_log_path)?;
+        writeln!(file, "{line}")
+    }
+
+    fn should_count_plan_result_frame(&self) -> bool {
+        self.standby_timer
+            .as_ref()
+            .and_then(|plan| plan.current.as_ref())
+            .is_some_and(|event| event.stage == StandbyTimerStage::Normal)
     }
 
     fn drain_serial_events(&mut self) {
@@ -506,6 +832,10 @@ impl SerialPanelApp {
                                         frame.raw_hex
                                     ));
                                 }
+                                if self.should_count_plan_result_frame() {
+                                    self.standby_plan_result
+                                        .record_normal_frame(&port, &parsed.states);
+                                }
                                 self.latest_frames.insert(port.clone(), frame);
                             }
                             ParsedFrameKind::SelfTestResult => {
@@ -541,7 +871,9 @@ impl SerialPanelApp {
                     if self.selected_port == port {
                         self.selected_port.clear();
                     }
-                    self.push_log(format!("{port} 已断开: {reason}"));
+                    if !(self.standby_active && should_hide_disconnect_log(&reason)) {
+                        self.push_log(format!("{port} 已断开: {reason}"));
+                    }
                 }
             }
         }
@@ -627,8 +959,446 @@ impl SerialPanelApp {
         let hex = hex_string(frame);
         self.manager.send_all(frame.to_vec());
         self.standby_active = matches!(action, StandbyAction::Start);
+        if self.standby_active {
+            self.parsers.clear();
+            self.latest_frames.clear();
+            self.self_test_frames.clear();
+            self.self_test_message.clear();
+        }
         self.standby_message = format!("{}待机帧已发送到全部串口: {hex}", action.label());
         self.push_log(self.standby_message.clone());
+    }
+
+    fn stop_standby_timer(&mut self) {
+        if self.standby_timer.take().is_some() {
+            self.standby_plan_result
+                .finish(PlanResultStatus::Interrupted);
+            self.standby_timer_message = "定时切换已停止".to_string();
+            self.push_log(self.standby_timer_message.clone());
+        }
+    }
+
+    fn interrupt_standby_timer(&mut self) {
+        if self.standby_timer.take().is_some() {
+            self.standby_plan_result
+                .finish(PlanResultStatus::Interrupted);
+            self.standby_timer_message = "定时计划已中断".to_string();
+            self.push_log(self.standby_timer_message.clone());
+        } else {
+            self.standby_timer_message = "当前没有运行中的定时计划".to_string();
+        }
+    }
+
+    fn update_standby_timer(&mut self) {
+        let should_advance = self
+            .standby_timer
+            .as_ref()
+            .and_then(|plan| plan.current.as_ref())
+            .and_then(|event| {
+                event
+                    .started_at
+                    .map(|started| started.elapsed() >= event.duration)
+            })
+            .unwrap_or(false);
+
+        if !should_advance {
+            return;
+        }
+
+        if let Some(plan) = self.standby_timer.as_mut() {
+            plan.completed_events = plan.completed_events.saturating_add(1);
+        }
+        self.start_next_plan_event();
+    }
+
+    fn start_plan_from_template(&mut self, template: PlanTemplate) {
+        if template.items.is_empty() {
+            self.standby_timer_message = "计划模板至少需要一个步骤".to_string();
+            return;
+        }
+
+        self.standby_plan_result.start(template.name.clone());
+        self.standby_timer = Some(StandbyPlanRun::from_template(&template));
+        self.start_next_plan_event();
+    }
+
+    fn append_template_to_current_plan(&mut self, template: PlanTemplate) {
+        if template.items.is_empty() {
+            self.template_edit_message = "计划模板至少需要一个步骤".to_string();
+            return;
+        }
+
+        if let Some(plan) = self.standby_timer.as_mut() {
+            plan.queue.extend(
+                template
+                    .items
+                    .iter()
+                    .map(ScheduledModeEvent::from_template_item),
+            );
+            self.template_edit_message = format!("已追加模板: {}", template.name);
+            self.push_log(self.template_edit_message.clone());
+        } else {
+            self.start_plan_from_template(template);
+        }
+    }
+
+    fn start_next_plan_event(&mut self) {
+        let next_event = {
+            let Some(plan) = self.standby_timer.as_mut() else {
+                return;
+            };
+
+            let Some(mut event) = plan.queue.pop_front() else {
+                let elapsed = plan.started_at.elapsed();
+                let completed_events = plan.completed_events;
+                let finish_action = plan.finish_action;
+                let template_name = plan.template_name.clone();
+                self.standby_timer = None;
+                self.finish_plan(template_name, completed_events, elapsed, finish_action);
+                return;
+            };
+
+            event.started_at = Some(Instant::now());
+            plan.current = Some(event.clone());
+            event
+        };
+
+        self.apply_mode_stage(next_event.stage);
+        self.standby_timer_message = format!(
+            "正在执行: {} / {}，时长 {}",
+            next_event.label,
+            next_event.stage.label(),
+            format_duration(next_event.duration)
+        );
+        self.push_log(self.standby_timer_message.clone());
+    }
+
+    fn finish_plan(
+        &mut self,
+        template_name: String,
+        completed_events: u64,
+        elapsed: Duration,
+        finish_action: PlanFinishAction,
+    ) {
+        self.standby_plan_result.finish(PlanResultStatus::Completed);
+
+        match finish_action {
+            PlanFinishAction::Normal => self.send_standby_frame(StandbyAction::Stop),
+            PlanFinishAction::Standby => self.send_standby_frame(StandbyAction::Start),
+            PlanFinishAction::KeepLast => {}
+        }
+
+        self.standby_timer_message = format!(
+            "计划已完成: {}，完成 {} 个步骤，用时 {}，结束后 {}",
+            template_name,
+            completed_events,
+            format_duration(elapsed),
+            finish_action.label()
+        );
+        self.push_log(self.standby_timer_message.clone());
+    }
+
+    fn apply_mode_stage(&mut self, stage: StandbyTimerStage) {
+        match stage {
+            StandbyTimerStage::Normal => self.send_standby_frame(StandbyAction::Stop),
+            StandbyTimerStage::Standby => self.send_standby_frame(StandbyAction::Start),
+        }
+    }
+
+    fn clamp_selected_template(&mut self) {
+        if self.standby_templates.is_empty() {
+            self.selected_standby_template = 0;
+        } else if self.selected_standby_template >= self.standby_templates.len() {
+            self.selected_standby_template = self.standby_templates.len() - 1;
+        }
+    }
+
+    fn selected_template(&self) -> Option<&PlanTemplate> {
+        self.standby_templates.get(self.selected_standby_template)
+    }
+
+    fn selected_template_mut(&mut self) -> Option<&mut PlanTemplate> {
+        self.standby_templates
+            .get_mut(self.selected_standby_template)
+    }
+
+    fn start_selected_template(&mut self) {
+        let Some(template) = self.selected_template().cloned() else {
+            self.template_edit_message = "没有可应用的计划模板".to_string();
+            return;
+        };
+
+        let template_name = template.name.clone();
+        self.start_plan_from_template(template);
+        self.template_edit_message = format!("已应用模板: {template_name}");
+    }
+
+    fn append_selected_template(&mut self) {
+        let Some(template) = self.selected_template().cloned() else {
+            self.template_edit_message = "没有可追加的计划模板".to_string();
+            return;
+        };
+
+        self.append_template_to_current_plan(template);
+    }
+
+    fn create_empty_custom_template(&mut self) {
+        let name = self.new_template_name_input.trim();
+        if name.is_empty() {
+            self.template_edit_message = "模板名称不能为空".to_string();
+            return;
+        }
+
+        let template = PlanTemplate::new(name, Vec::new(), PlanFinishAction::Normal, true);
+        self.standby_templates.push(template);
+        self.selected_standby_template = self.standby_templates.len() - 1;
+        self.save_custom_templates_with_message(format!("已新建自定义模板: {name}"));
+    }
+
+    fn copy_selected_template_as_custom(&mut self) {
+        let Some(mut template) = self.selected_template().cloned() else {
+            self.template_edit_message = "没有可复制的模板".to_string();
+            return;
+        };
+
+        let name = self.new_template_name_input.trim();
+        template.name = if name.is_empty() {
+            format!("{} 副本", template.name)
+        } else {
+            name.to_string()
+        };
+        template.is_custom = true;
+        self.standby_templates.push(template);
+        self.selected_standby_template = self.standby_templates.len() - 1;
+        self.save_custom_templates_with_message("已复制为自定义模板".to_string());
+    }
+
+    fn save_selected_custom_template(&mut self) {
+        let Some(template) = self.selected_template() else {
+            self.template_edit_message = "没有可保存的模板".to_string();
+            return;
+        };
+
+        if !template.is_custom {
+            self.template_edit_message = "内置模板不能直接保存，请先复制为自定义模板".to_string();
+            return;
+        }
+        if template.name.trim().is_empty() {
+            self.template_edit_message = "模板名称不能为空".to_string();
+            return;
+        }
+        if template.items.is_empty() {
+            self.template_edit_message = "模板至少需要一个步骤".to_string();
+            return;
+        }
+
+        self.save_custom_templates_with_message(format!("已保存自定义模板: {}", template.name));
+    }
+
+    fn delete_selected_custom_template(&mut self) {
+        let Some(template) = self.selected_template() else {
+            self.template_edit_message = "没有可删除的模板".to_string();
+            return;
+        };
+        if !template.is_custom {
+            self.template_edit_message = "内置模板不能删除".to_string();
+            return;
+        }
+
+        let removed_name = template.name.clone();
+        self.standby_templates
+            .remove(self.selected_standby_template);
+        self.clamp_selected_template();
+        self.save_custom_templates_with_message(format!("已删除自定义模板: {removed_name}"));
+    }
+
+    fn clear_selected_custom_template_items(&mut self) {
+        if !self
+            .selected_template()
+            .is_some_and(|template| template.is_custom)
+        {
+            self.template_edit_message = "内置模板不能编辑，请先复制为自定义模板".to_string();
+            return;
+        }
+
+        if let Some(template) = self.selected_template_mut() {
+            let removed_count = template.items.len();
+            template.items.clear();
+            self.template_edit_message = format!("已清空模板步骤: {removed_count} 步");
+        }
+    }
+
+    fn save_custom_templates_with_message(&mut self, success_message: String) {
+        match save_custom_plan_templates(&self.standby_templates) {
+            Ok(()) => {
+                self.template_edit_message = success_message;
+                self.push_log(self.template_edit_message.clone());
+            }
+            Err(err) => {
+                self.template_edit_message = format!("保存自定义模板失败: {err}");
+            }
+        }
+    }
+
+    fn item_from_template_inputs(&mut self) -> Option<PlanTemplateItem> {
+        let duration = match parse_hms_duration(
+            &self.template_item_hours_input,
+            &self.template_item_minutes_input,
+            &self.template_item_seconds_input,
+        ) {
+            Some(duration) => duration,
+            None => {
+                self.template_edit_message = "步骤时长无效".to_string();
+                return None;
+            }
+        };
+
+        let label = self.template_item_label_input.trim();
+        let label = if label.is_empty() {
+            self.template_item_stage.label().to_string()
+        } else {
+            label.to_string()
+        };
+
+        Some(PlanTemplateItem::new(
+            label,
+            self.template_item_stage,
+            duration,
+        ))
+    }
+
+    fn add_item_to_selected_template(&mut self) {
+        if !self
+            .selected_template()
+            .is_some_and(|template| template.is_custom)
+        {
+            self.template_edit_message = "内置模板不能编辑，请先复制为自定义模板".to_string();
+            return;
+        }
+
+        let Some(item) = self.item_from_template_inputs() else {
+            return;
+        };
+        let label = item.label.clone();
+        let repeat_count = self
+            .template_item_repeat_count
+            .clamp(1, MAX_TEMPLATE_ITEM_REPEAT_COUNT);
+        self.template_item_repeat_count = repeat_count;
+
+        if let Some(template) = self.selected_template_mut() {
+            template.items.extend((0..repeat_count).map(|_| item.clone()));
+            self.template_edit_message = if repeat_count == 1 {
+                format!("已添加步骤: {label}")
+            } else {
+                format!("已添加步骤: {label} x {repeat_count}")
+            };
+        }
+    }
+
+    fn add_item_to_template_sub_plan(&mut self) {
+        let Some(item) = self.item_from_template_inputs() else {
+            return;
+        };
+
+        let label = item.label.clone();
+        self.template_sub_plan_items.push(item);
+        self.template_edit_message = format!(
+            "已加入子计划: {label}，当前 {} 个步骤",
+            self.template_sub_plan_items.len()
+        );
+    }
+
+    fn add_sub_plan_to_selected_template(&mut self) {
+        if !self
+            .selected_template()
+            .is_some_and(|template| template.is_custom)
+        {
+            self.template_edit_message = "内置模板不能编辑，请先复制为自定义模板".to_string();
+            return;
+        }
+
+        if self.template_sub_plan_items.is_empty() {
+            self.template_edit_message = "子计划至少需要一个步骤".to_string();
+            return;
+        }
+
+        let repeat_count = self
+            .template_sub_plan_repeat_count
+            .clamp(1, MAX_TEMPLATE_ITEM_REPEAT_COUNT);
+        self.template_sub_plan_repeat_count = repeat_count;
+        let sub_plan_items = self.template_sub_plan_items.clone();
+        let sub_plan_len = sub_plan_items.len();
+
+        if let Some(template) = self.selected_template_mut() {
+            template.items.extend(
+                (0..repeat_count).flat_map(|_| sub_plan_items.iter().cloned()),
+            );
+            self.template_edit_message = format!(
+                "已添加子计划: {sub_plan_len} 个步骤 x {repeat_count} 次"
+            );
+        }
+    }
+
+    fn clear_template_sub_plan(&mut self) {
+        self.template_sub_plan_items.clear();
+        self.template_edit_message = "子计划已清空".to_string();
+    }
+
+    fn remove_template_sub_plan_item(&mut self, index: usize) {
+        if index < self.template_sub_plan_items.len() {
+            let item = self.template_sub_plan_items.remove(index);
+            self.template_edit_message = format!("已从子计划删除步骤: {}", item.label);
+        }
+    }
+
+    fn move_template_sub_plan_item(&mut self, index: usize, offset: isize) {
+        let len = self.template_sub_plan_items.len();
+        if index >= len {
+            return;
+        }
+
+        let next_index = index.saturating_add_signed(offset).min(len - 1);
+        if next_index != index {
+            self.template_sub_plan_items.swap(index, next_index);
+        }
+    }
+
+    fn remove_template_item(&mut self, index: usize) {
+        if !self
+            .selected_template()
+            .is_some_and(|template| template.is_custom)
+        {
+            self.template_edit_message = "内置模板不能编辑，请先复制为自定义模板".to_string();
+            return;
+        }
+
+        if let Some(template) = self.selected_template_mut() {
+            if index < template.items.len() {
+                let item = template.items.remove(index);
+                self.template_edit_message = format!("已删除步骤: {}", item.label);
+            }
+        }
+    }
+
+    fn move_template_item(&mut self, index: usize, offset: isize) {
+        if !self
+            .selected_template()
+            .is_some_and(|template| template.is_custom)
+        {
+            self.template_edit_message = "内置模板不能编辑，请先复制为自定义模板".to_string();
+            return;
+        }
+
+        if let Some(template) = self.selected_template_mut() {
+            let len = template.items.len();
+            if index >= len {
+                return;
+            }
+            let next_index = index.saturating_add_signed(offset).min(len - 1);
+            if next_index != index {
+                template.items.swap(index, next_index);
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -698,6 +1468,12 @@ impl SerialPanelApp {
     }
 
     fn draw_overview(&self, ui: &mut egui::Ui) {
+        if self.standby_active {
+            ui.heading("串口状态窗口");
+            ui.label("待机模式中");
+            return;
+        }
+
         if self.latest_frames.is_empty() && self.self_test_frames.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(80.0);
@@ -735,13 +1511,470 @@ impl SerialPanelApp {
         }
     }
 
+    fn draw_timer_mode(&mut self, ui: &mut egui::Ui) {
+        self.clamp_selected_template();
+
+        ui.heading("定时计划");
+        ui.label(format!(
+            "当前状态: {}",
+            if self.standby_active {
+                "待机模式"
+            } else {
+                "正常模式"
+            }
+        ));
+        self.draw_plan_run_status(ui);
+        self.draw_plan_result_panel(ui);
+
+        ui.horizontal(|ui| {
+            ui.label("自定义模板名");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_template_name_input).desired_width(150.0),
+            );
+            if ui.button("新建").clicked() {
+                self.create_empty_custom_template();
+            }
+            if ui.button("复制当前").clicked() {
+                self.copy_selected_template_as_custom();
+            }
+        });
+
+        ui.separator();
+        ui.heading("计划模板");
+        if self.standby_templates.is_empty() {
+            ui.label("暂无模板");
+        } else {
+            let selected_name = self
+                .selected_template()
+                .map(|template| template.name.as_str())
+                .unwrap_or("未选择");
+            egui::ComboBox::from_id_salt("standby_plan_templates")
+                .selected_text(selected_name)
+                .show_ui(ui, |ui| {
+                    for (idx, template) in self.standby_templates.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut self.selected_standby_template,
+                            idx,
+                            template.name.as_str(),
+                        );
+                    }
+                });
+
+            ui.horizontal(|ui| {
+                if ui.button("应用模板").clicked() {
+                    self.start_selected_template();
+                }
+                if ui.button("追加到队列").clicked() {
+                    self.append_selected_template();
+                }
+                if ui.button("保存自定义").clicked() {
+                    self.save_selected_custom_template();
+                }
+                if ui.button("清空模板步骤").clicked() {
+                    self.clear_selected_custom_template_items();
+                }
+                if ui.button("一键删除模板").clicked() {
+                    self.delete_selected_custom_template();
+                }
+            });
+
+            self.draw_selected_template_editor(ui);
+        }
+        if !self.standby_timer_message.is_empty() {
+            ui.label(&self.standby_timer_message);
+        }
+        if !self.template_edit_message.is_empty() {
+            ui.label(&self.template_edit_message);
+        }
+    }
+
+    fn draw_plan_result_panel(&self, ui: &mut egui::Ui) {
+        let stats = &self.standby_plan_result;
+
+        ui.separator();
+        ui.group(|ui| {
+            ui.heading("定时计划总结果");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("结果");
+                let color = match stats.status {
+                    PlanResultStatus::Completed if stats.alarm_frames == 0 => {
+                        egui::Color32::from_rgb(38, 166, 91)
+                    }
+                    PlanResultStatus::Completed => egui::Color32::from_rgb(220, 53, 69),
+                    PlanResultStatus::Interrupted => egui::Color32::from_rgb(245, 158, 11),
+                    _ => ui.visuals().text_color(),
+                };
+                ui.colored_label(color, stats.result_label());
+                ui.separator();
+                ui.label(format!("状态: {}", stats.status.label()));
+            });
+
+            if stats.status == PlanResultStatus::Idle {
+                ui.label("尚未运行定时计划");
+                return;
+            }
+
+            ui.label(format!("模板: {}", stats.template_name));
+            ui.label("统计范围: 只统计正常模式阶段收到的状态帧，待机阶段不计入");
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("统计帧数: {}", stats.checked_frames));
+                ui.separator();
+                ui.label(format!("报警帧数: {}", stats.alarm_frames));
+                ui.separator();
+                ui.label(format!("报警点数: {}", stats.alarm_points));
+                ui.separator();
+                ui.label(format!("统计用时: {}", format_duration(stats.elapsed_duration())));
+            });
+
+            if stats.last_alarm.is_empty() {
+                ui.label("最后报警: 无");
+            } else {
+                ui.label(format!("最后报警: {}", stats.last_alarm));
+            }
+
+            let port_axis_counts = stats.sorted_port_axis_counts();
+            ui.separator();
+            ui.label("各 COM / 轴位报警次数");
+            if port_axis_counts.is_empty() {
+                ui.label("暂无报警计数");
+            } else {
+                egui::Grid::new("plan_result_port_axis_counts")
+                    .num_columns(3)
+                    .spacing(egui::vec2(12.0, 6.0))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("COM");
+                        ui.strong("轴位");
+                        ui.strong("次数");
+                        ui.end_row();
+
+                        for (port, sensor_idx, axis_idx, count) in port_axis_counts {
+                            ui.label(port);
+                            ui.label(format!("{}{}", SENSOR_NAMES[sensor_idx], AXIS_NAMES[axis_idx]));
+                            ui.label(count.to_string());
+                            ui.end_row();
+                        }
+                    });
+            }
+        });
+    }
+
+    fn draw_plan_run_status(&mut self, ui: &mut egui::Ui) {
+        let Some(plan) = &self.standby_timer else {
+            ui.label("计划状态: 未运行");
+            return;
+        };
+
+        ui.label(format!(
+            "计划状态: {}，已完成 {} 个步骤，已运行 {}",
+            plan.template_name,
+            plan.completed_events,
+            format_duration(plan.started_at.elapsed())
+        ));
+        ui.label(format!(
+            "队列剩余: {}，结束后: {}",
+            format_duration(plan.pending_duration()),
+            plan.finish_action.label()
+        ));
+
+        if let Some(current) = &plan.current {
+            let elapsed = current
+                .started_at
+                .map_or(Duration::ZERO, |started| started.elapsed());
+            ui.label(format!(
+                "运行中: {} / {}，剩余 {}",
+                current.label,
+                current.stage.label(),
+                format_duration(duration_remaining(current.duration, elapsed))
+            ));
+        }
+
+        if ui.button("中断定时计划").clicked() {
+            self.interrupt_standby_timer();
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("计划队列: 等待 {} 步", plan.queue.len()));
+            let label = if self.plan_queue_expanded {
+                "折叠"
+            } else {
+                "展开"
+            };
+            if ui.button(label).clicked() {
+                self.plan_queue_expanded = !self.plan_queue_expanded;
+            }
+        });
+
+        if self.plan_queue_expanded {
+            egui::Grid::new("standby_plan_queue")
+                .num_columns(4)
+                .spacing(egui::vec2(10.0, 6.0))
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("状态");
+                    ui.strong("步骤");
+                    ui.strong("模式");
+                    ui.strong("时长");
+                    ui.end_row();
+
+                    if let Some(current) = &plan.current {
+                        ui.label("运行中");
+                        ui.label(&current.label);
+                        ui.label(current.stage.label());
+                        ui.label(format_duration(current.duration));
+                        ui.end_row();
+                    }
+
+                    for event in &plan.queue {
+                        ui.label("等待中");
+                        ui.label(&event.label);
+                        ui.label(event.stage.label());
+                        ui.label(format_duration(event.duration));
+                        ui.end_row();
+                    }
+                });
+        } else if let Some(next) = plan.queue.front() {
+            ui.label(format!(
+                "下一步: {} / {} / {}",
+                next.label,
+                next.stage.label(),
+                format_duration(next.duration)
+            ));
+        } else {
+            ui.label("等待队列为空");
+        }
+    }
+
+    fn draw_selected_template_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(template) = self.selected_template() else {
+            return;
+        };
+        let is_custom = template.is_custom;
+        let items_snapshot = template.items.clone();
+
+        if is_custom {
+            if let Some(template) = self.selected_template_mut() {
+                ui.horizontal(|ui| {
+                    ui.label("名称");
+                    ui.add(egui::TextEdit::singleline(&mut template.name).desired_width(130.0));
+                    egui::ComboBox::from_id_salt("template_finish_action")
+                        .selected_text(template.finish_action.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut template.finish_action,
+                                PlanFinishAction::Normal,
+                                PlanFinishAction::Normal.label(),
+                            );
+                            ui.selectable_value(
+                                &mut template.finish_action,
+                                PlanFinishAction::Standby,
+                                PlanFinishAction::Standby.label(),
+                            );
+                            ui.selectable_value(
+                                &mut template.finish_action,
+                                PlanFinishAction::KeepLast,
+                                PlanFinishAction::KeepLast.label(),
+                            );
+                        });
+                });
+            }
+        } else {
+            ui.label("内置模板只读，可复制为自定义模板后编辑");
+            ui.label(format!("结束后: {}", template.finish_action.label()));
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("模板步骤: {} 步", items_snapshot.len()));
+            let label = if self.template_items_expanded {
+                "折叠"
+            } else {
+                "展开"
+            };
+            if ui.button(label).clicked() {
+                self.template_items_expanded = !self.template_items_expanded;
+            }
+        });
+        if self.template_items_expanded {
+            egui::Grid::new("template_items_grid")
+                .num_columns(5)
+                .spacing(egui::vec2(8.0, 6.0))
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("步骤");
+                    ui.strong("模式");
+                    ui.strong("时长");
+                    ui.strong("排序");
+                    ui.strong("操作");
+                    ui.end_row();
+
+                    for (idx, item) in items_snapshot.iter().enumerate() {
+                        ui.label(&item.label);
+                        ui.label(item.stage.label());
+                        ui.label(format_duration(item.duration));
+                        if is_custom {
+                            ui.horizontal(|ui| {
+                                if ui.button("上").clicked() {
+                                    self.move_template_item(idx, -1);
+                                }
+                                if ui.button("下").clicked() {
+                                    self.move_template_item(idx, 1);
+                                }
+                            });
+                            if ui.button("删除").clicked() {
+                                self.remove_template_item(idx);
+                            }
+                        } else {
+                            ui.label("-");
+                            ui.label("-");
+                        }
+                        ui.end_row();
+                    }
+                });
+        } else if let Some(item) = items_snapshot.first() {
+            ui.label(format!(
+                "首步: {} / {} / {}",
+                item.label,
+                item.stage.label(),
+                format_duration(item.duration)
+            ));
+        } else {
+            ui.label("模板暂无步骤");
+        }
+
+        if !is_custom {
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("新增步骤");
+            egui::ComboBox::from_id_salt("template_item_stage")
+                .selected_text(self.template_item_stage.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.template_item_stage,
+                        StandbyTimerStage::Normal,
+                        StandbyTimerStage::Normal.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.template_item_stage,
+                        StandbyTimerStage::Standby,
+                        StandbyTimerStage::Standby.label(),
+                    );
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.template_item_label_input).desired_width(96.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.template_item_hours_input).desired_width(36.0),
+            );
+            ui.label("时");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.template_item_minutes_input)
+                    .desired_width(36.0),
+            );
+            ui.label("分");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.template_item_seconds_input)
+                    .desired_width(36.0),
+            );
+            ui.label("秒");
+            ui.label("次数");
+            ui.add(
+                egui::DragValue::new(&mut self.template_item_repeat_count)
+                    .range(1..=MAX_TEMPLATE_ITEM_REPEAT_COUNT)
+                    .speed(1),
+            );
+            if ui.button("添加").clicked() {
+                self.add_item_to_selected_template();
+            }
+        });
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("子计划步骤");
+            if ui.button("添加步骤到子计划").clicked() {
+                self.add_item_to_template_sub_plan();
+            }
+            ui.label(format!("当前 {} 步", self.template_sub_plan_items.len()));
+            let label = if self.template_sub_plan_expanded {
+                "折叠"
+            } else {
+                "展开"
+            };
+            if ui.button(label).clicked() {
+                self.template_sub_plan_expanded = !self.template_sub_plan_expanded;
+            }
+            if ui.button("清空子计划").clicked() {
+                self.clear_template_sub_plan();
+            }
+        });
+
+        if self.template_sub_plan_items.is_empty() {
+            ui.label("子计划暂无步骤");
+        } else if self.template_sub_plan_expanded {
+            let sub_plan_snapshot = self.template_sub_plan_items.clone();
+            egui::Grid::new("template_sub_plan_items_grid")
+                .num_columns(5)
+                .spacing(egui::vec2(8.0, 6.0))
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("步骤");
+                    ui.strong("模式");
+                    ui.strong("时长");
+                    ui.strong("排序");
+                    ui.strong("操作");
+                    ui.end_row();
+
+                    for (idx, item) in sub_plan_snapshot.iter().enumerate() {
+                        ui.label(&item.label);
+                        ui.label(item.stage.label());
+                        ui.label(format_duration(item.duration));
+                        ui.horizontal(|ui| {
+                            if ui.button("上").clicked() {
+                                self.move_template_sub_plan_item(idx, -1);
+                            }
+                            if ui.button("下").clicked() {
+                                self.move_template_sub_plan_item(idx, 1);
+                            }
+                        });
+                        if ui.button("删除").clicked() {
+                            self.remove_template_sub_plan_item(idx);
+                        }
+                        ui.end_row();
+                    }
+                });
+        } else if let Some(item) = self.template_sub_plan_items.first() {
+            ui.label(format!(
+                "首步: {} / {} / {}",
+                item.label,
+                item.stage.label(),
+                format_duration(item.duration)
+            ));
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("添加子计划");
+            ui.label(format!("每轮 {} 步", self.template_sub_plan_items.len()));
+            ui.label("次数");
+            ui.add(
+                egui::DragValue::new(&mut self.template_sub_plan_repeat_count)
+                    .range(1..=MAX_TEMPLATE_ITEM_REPEAT_COUNT)
+                    .speed(1),
+            );
+            if ui.button("添加子计划").clicked() {
+                self.add_sub_plan_to_selected_template();
+            }
+        });
+    }
+
     fn save_logs_to_file(&mut self) {
         if self.logs.is_empty() {
             self.log_save_message = "没有可保存的日志".to_string();
             return;
         }
 
-        let dir = Path::new("logs");
+        let dir = Path::new(CURRENT_LOG_DIR);
         if let Err(err) = fs::create_dir_all(dir) {
             self.log_save_message = format!("创建日志目录失败: {err}");
             return;
@@ -768,7 +2001,7 @@ impl SerialPanelApp {
         }
 
         self.logs.clear();
-        self.log_save_message = "当前日志已清除".to_string();
+        self.log_save_message = "当前界面日志已清除，自动保存文件不受影响".to_string();
     }
 
     fn draw_logs(&mut self, ui: &mut egui::Ui) {
@@ -785,6 +2018,7 @@ impl SerialPanelApp {
         if !self.log_save_message.is_empty() {
             ui.label(&self.log_save_message);
         }
+        ui.label(format!("自动保存: {}", self.auto_log_path.display()));
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .show(ui, |ui| {
@@ -855,6 +2089,7 @@ fn draw_sensor_grid(ui: &mut egui::Ui, frame: &SensorFrame, standby_active: bool
 impl eframe::App for SerialPanelApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_serial_events();
+        self.update_standby_timer();
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.heading("串口报警面板");
@@ -951,9 +2186,11 @@ impl eframe::App for SerialPanelApp {
                 ui.heading("待机模式");
                 ui.horizontal(|ui| {
                     if ui.button("开始待机").clicked() {
+                        self.stop_standby_timer();
                         self.send_standby_frame(StandbyAction::Start);
                     }
                     if ui.button("停止待机").clicked() {
+                        self.stop_standby_timer();
                         self.send_standby_frame(StandbyAction::Stop);
                     }
                 });
@@ -962,10 +2199,30 @@ impl eframe::App for SerialPanelApp {
                 }
             });
 
+        egui::TopBottomPanel::bottom("logs_panel")
+            .resizable(true)
+            .default_height(220.0)
+            .min_height(120.0)
+            .show(ctx, |ui| {
+                self.draw_logs(ui);
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.draw_overview(ui);
-            self.draw_self_test_overview(ui);
-            self.draw_logs(ui);
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    self.draw_overview(ui);
+                    self.draw_self_test_overview(ui);
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("timer_mode_scroll")
+                        .max_height(ui.available_height())
+                        .show(ui, |ui| {
+                            self.draw_timer_mode(ui);
+                        });
+                });
+            });
         });
         self.draw_port_windows(ctx);
 
@@ -981,6 +2238,14 @@ fn draw_state_badge(ui: &mut egui::Ui, state: AlarmState) {
         .stroke(egui::Stroke::new(1.0, color))
         .min_size(egui::vec2(82.0, 32.0));
     ui.add_enabled(false, button);
+}
+
+fn count_alarm_points(states: &[[AlarmState; 3]; 3]) -> u64 {
+    states
+        .iter()
+        .flat_map(|sensor| sensor.iter())
+        .filter(|state| **state == AlarmState::Alarm)
+        .count() as u64
 }
 
 fn alarm_summary(states: &[[AlarmState; 3]; 3]) -> Option<String> {
@@ -1001,6 +2266,11 @@ fn alarm_summary(states: &[[AlarmState; 3]; 3]) -> Option<String> {
     } else {
         Some(alarms.join(", "))
     }
+}
+
+fn should_hide_disconnect_log(reason: &str) -> bool {
+    reason.contains("open failed")
+        && (reason.contains("拒绝访问") || reason.contains("Access denied"))
 }
 
 fn format_self_test_result_line(frame: &SensorFrame) -> String {
@@ -1055,6 +2325,10 @@ fn filename_time_string() -> String {
     }
 }
 
+fn auto_log_path() -> PathBuf {
+    Path::new(AUTO_LOG_DIR).join(format!("auto_log_{}.txt", filename_time_string()))
+}
+
 fn format_local_time(unix_ms: i64) -> String {
     let local_ms = unix_ms + 8 * 3600 * 1000;
     let total_seconds = local_ms.div_euclid(1000);
@@ -1104,6 +2378,267 @@ fn build_threshold_frame(values: [i16; 6]) -> Vec<u8> {
     }
     frame.extend_from_slice(&FRAME_TAIL);
     frame
+}
+
+fn parse_nonnegative_u64(input: &str) -> Option<u64> {
+    input.trim().parse::<u64>().ok()
+}
+
+fn parse_hms_duration(hours: &str, minutes: &str, seconds: &str) -> Option<Duration> {
+    let hours = parse_nonnegative_u64(hours)?;
+    let minutes = parse_nonnegative_u64(minutes)?;
+    let seconds = parse_nonnegative_u64(seconds)?;
+    if minutes >= 60 || seconds >= 60 {
+        return None;
+    }
+
+    let total_seconds = hours
+        .checked_mul(3600)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)?;
+
+    if total_seconds == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(total_seconds))
+    }
+}
+
+fn load_plan_templates() -> Vec<PlanTemplate> {
+    let mut templates = default_plan_templates();
+    templates.extend(load_custom_plan_templates());
+    templates
+}
+
+fn default_plan_templates() -> Vec<PlanTemplate> {
+    vec![
+        template_from_interval_cycles("默认模板", Duration::from_secs(30 * 60), 3),
+        PlanTemplate::new(
+            "长时间运行",
+            vec![
+                PlanTemplateItem::new(
+                    "长运行",
+                    StandbyTimerStage::Normal,
+                    Duration::from_secs(120 * 60),
+                ),
+                PlanTemplateItem::new(
+                    "短待机",
+                    StandbyTimerStage::Standby,
+                    Duration::from_secs(10 * 60),
+                ),
+            ],
+            PlanFinishAction::Normal,
+            false,
+        ),
+    ]
+}
+
+fn template_from_interval_cycles(
+    name: impl Into<String>,
+    interval: Duration,
+    cycles: u32,
+) -> PlanTemplate {
+    let mut items = Vec::with_capacity(cycles as usize * 2);
+    for cycle in 1..=cycles {
+        items.push(PlanTemplateItem::new(
+            format!("第 {cycle} 次正常"),
+            StandbyTimerStage::Normal,
+            interval,
+        ));
+        items.push(PlanTemplateItem::new(
+            format!("第 {cycle} 次待机"),
+            StandbyTimerStage::Standby,
+            interval,
+        ));
+    }
+
+    PlanTemplate::new(name, items, PlanFinishAction::Normal, false)
+}
+
+fn load_custom_plan_templates() -> Vec<PlanTemplate> {
+    let Ok(content) = fs::read_to_string(CUSTOM_PLAN_TEMPLATES_PATH) else {
+        return Vec::new();
+    };
+
+    let mut templates = Vec::new();
+    let mut current: Option<PlanTemplate> = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts = line.split('\t').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["template", name, finish_action] => {
+                if let Some(template) = current.take() {
+                    if !template.items.is_empty() {
+                        templates.push(template);
+                    }
+                }
+                current = Some(PlanTemplate::new(
+                    decode_template_field(name),
+                    Vec::new(),
+                    parse_finish_action(finish_action).unwrap_or(PlanFinishAction::Normal),
+                    true,
+                ));
+            }
+            ["template", name, _legacy_flag, finish_action] => {
+                if let Some(template) = current.take() {
+                    if !template.items.is_empty() {
+                        templates.push(template);
+                    }
+                }
+                current = Some(PlanTemplate::new(
+                    decode_template_field(name),
+                    Vec::new(),
+                    parse_finish_action(finish_action).unwrap_or(PlanFinishAction::Normal),
+                    true,
+                ));
+            }
+            ["item", label, stage, seconds] => {
+                let Some(template) = current.as_mut() else {
+                    continue;
+                };
+                let Some(stage) = parse_timer_stage(stage) else {
+                    continue;
+                };
+                let Ok(seconds) = seconds.parse::<u64>() else {
+                    continue;
+                };
+                if seconds == 0 {
+                    continue;
+                }
+                template.items.push(PlanTemplateItem::new(
+                    decode_template_field(label),
+                    stage,
+                    Duration::from_secs(seconds),
+                ));
+            }
+            ["end"] => {
+                if let Some(template) = current.take() {
+                    if !template.items.is_empty() {
+                        templates.push(template);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(template) = current {
+        if !template.items.is_empty() {
+            templates.push(template);
+        }
+    }
+
+    templates
+}
+
+fn save_custom_plan_templates(templates: &[PlanTemplate]) -> io::Result<()> {
+    let mut lines = Vec::new();
+    for template in templates.iter().filter(|template| template.is_custom) {
+        lines.push(format!(
+            "template\t{}\t{}",
+            encode_template_field(&template.name),
+            finish_action_code(template.finish_action)
+        ));
+        for item in &template.items {
+            lines.push(format!(
+                "item\t{}\t{}\t{}",
+                encode_template_field(&item.label),
+                timer_stage_code(item.stage),
+                item.duration.as_secs()
+            ));
+        }
+        lines.push("end".to_string());
+    }
+
+    fs::write(CUSTOM_PLAN_TEMPLATES_PATH, lines.join("\n"))
+}
+
+fn encode_template_field(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn decode_template_field(value: &str) -> String {
+    let mut decoded = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('t') => decoded.push('\t'),
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('\\') => decoded.push('\\'),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+fn finish_action_code(action: PlanFinishAction) -> &'static str {
+    match action {
+        PlanFinishAction::Normal => "normal",
+        PlanFinishAction::Standby => "standby",
+        PlanFinishAction::KeepLast => "keep-last",
+    }
+}
+
+fn parse_finish_action(value: &str) -> Option<PlanFinishAction> {
+    match value {
+        "normal" => Some(PlanFinishAction::Normal),
+        "standby" => Some(PlanFinishAction::Standby),
+        "keep-last" => Some(PlanFinishAction::KeepLast),
+        _ => None,
+    }
+}
+
+fn timer_stage_code(stage: StandbyTimerStage) -> &'static str {
+    match stage {
+        StandbyTimerStage::Normal => "normal",
+        StandbyTimerStage::Standby => "standby",
+    }
+}
+
+fn parse_timer_stage(value: &str) -> Option<StandbyTimerStage> {
+    match value {
+        "normal" => Some(StandbyTimerStage::Normal),
+        "standby" => Some(StandbyTimerStage::Standby),
+        _ => None,
+    }
+}
+
+fn duration_remaining(total: Duration, elapsed: Duration) -> Duration {
+    total.checked_sub(elapsed).unwrap_or(Duration::ZERO)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}小时{minutes:02}分{seconds:02}秒")
+    } else if minutes > 0 {
+        format!("{minutes}分{seconds:02}秒")
+    } else {
+        format!("{seconds}秒")
+    }
 }
 
 fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, String> {
