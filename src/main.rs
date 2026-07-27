@@ -341,6 +341,21 @@ enum PlanFinishAction {
     KeepLast,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimerPageTab {
+    Monitor,
+    Editor,
+}
+
+impl TimerPageTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Monitor => "运行监控",
+            Self::Editor => "计划编辑",
+        }
+    }
+}
+
 impl PlanFinishAction {
     fn label(self) -> &'static str {
         match self {
@@ -711,9 +726,11 @@ struct SerialPanelApp {
     template_item_repeat_count: usize,
     template_sub_plan_items: Vec<PlanTemplateItem>,
     template_sub_plan_repeat_count: usize,
+    template_sub_plan_clear_after_insert: bool,
+    timer_page_tab: TimerPageTab,
+    template_delete_confirmation: bool,
     plan_queue_expanded: bool,
     template_items_expanded: bool,
-    template_sub_plan_expanded: bool,
     template_edit_message: String,
     invalid_send_message: String,
     log_save_message: String,
@@ -755,9 +772,11 @@ impl SerialPanelApp {
             template_item_repeat_count: 1,
             template_sub_plan_items: Vec::new(),
             template_sub_plan_repeat_count: 1,
+            template_sub_plan_clear_after_insert: true,
+            timer_page_tab: TimerPageTab::Monitor,
+            template_delete_confirmation: false,
             plan_queue_expanded: false,
             template_items_expanded: false,
-            template_sub_plan_expanded: true,
             template_edit_message: String::new(),
             invalid_send_message: String::new(),
             log_save_message: String::new(),
@@ -1124,13 +1143,14 @@ impl SerialPanelApp {
 
     fn start_selected_template(&mut self) {
         let Some(template) = self.selected_template().cloned() else {
-            self.template_edit_message = "没有可应用的计划模板".to_string();
+            self.template_edit_message = "没有可运行的计划模板".to_string();
             return;
         };
 
         let template_name = template.name.clone();
         self.start_plan_from_template(template);
-        self.template_edit_message = format!("已应用模板: {template_name}");
+        self.template_edit_message = format!("已开始运行: {template_name}");
+        self.timer_page_tab = TimerPageTab::Monitor;
     }
 
     fn append_selected_template(&mut self) {
@@ -1286,7 +1306,9 @@ impl SerialPanelApp {
         self.template_item_repeat_count = repeat_count;
 
         if let Some(template) = self.selected_template_mut() {
-            template.items.extend((0..repeat_count).map(|_| item.clone()));
+            template
+                .items
+                .extend((0..repeat_count).map(|_| item.clone()));
             self.template_edit_message = if repeat_count == 1 {
                 format!("已添加步骤: {label}")
             } else {
@@ -1303,7 +1325,7 @@ impl SerialPanelApp {
         let label = item.label.clone();
         self.template_sub_plan_items.push(item);
         self.template_edit_message = format!(
-            "已加入子计划: {label}，当前 {} 个步骤",
+            "已加入循环步骤组: {label}，当前一轮共 {} 步",
             self.template_sub_plan_items.len()
         );
     }
@@ -1318,7 +1340,7 @@ impl SerialPanelApp {
         }
 
         if self.template_sub_plan_items.is_empty() {
-            self.template_edit_message = "子计划至少需要一个步骤".to_string();
+            self.template_edit_message = "循环步骤组至少需要一个步骤".to_string();
             return;
         }
 
@@ -1330,24 +1352,27 @@ impl SerialPanelApp {
         let sub_plan_len = sub_plan_items.len();
 
         if let Some(template) = self.selected_template_mut() {
-            template.items.extend(
-                (0..repeat_count).flat_map(|_| sub_plan_items.iter().cloned()),
-            );
-            self.template_edit_message = format!(
-                "已添加子计划: {sub_plan_len} 个步骤 x {repeat_count} 次"
-            );
+            template
+                .items
+                .extend((0..repeat_count).flat_map(|_| sub_plan_items.iter().cloned()));
+            self.template_edit_message =
+                format!("已插入循环步骤组: 每轮 {sub_plan_len} 步，共 {repeat_count} 轮");
+        }
+
+        if self.template_sub_plan_clear_after_insert {
+            self.template_sub_plan_items.clear();
         }
     }
 
     fn clear_template_sub_plan(&mut self) {
         self.template_sub_plan_items.clear();
-        self.template_edit_message = "子计划已清空".to_string();
+        self.template_edit_message = "循环步骤组已清空".to_string();
     }
 
     fn remove_template_sub_plan_item(&mut self, index: usize) {
         if index < self.template_sub_plan_items.len() {
             let item = self.template_sub_plan_items.remove(index);
-            self.template_edit_message = format!("已从子计划删除步骤: {}", item.label);
+            self.template_edit_message = format!("已从循环步骤组删除: {}", item.label);
         }
     }
 
@@ -1514,88 +1539,186 @@ impl SerialPanelApp {
     fn draw_timer_mode(&mut self, ui: &mut egui::Ui) {
         self.clamp_selected_template();
 
-        ui.heading("定时计划");
-        ui.label(format!(
-            "当前状态: {}",
-            if self.standby_active {
-                "待机模式"
-            } else {
-                "正常模式"
-            }
-        ));
-        self.draw_plan_run_status(ui);
-        self.draw_plan_result_panel(ui);
-
         ui.horizontal(|ui| {
-            ui.label("自定义模板名");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.new_template_name_input).desired_width(150.0),
-            );
-            if ui.button("新建").clicked() {
-                self.create_empty_custom_template();
-            }
-            if ui.button("复制当前").clicked() {
-                self.copy_selected_template_as_custom();
+            ui.heading("定时计划");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (label, color) = if self.standby_active {
+                    ("● 待机模式", egui::Color32::from_rgb(245, 158, 11))
+                } else {
+                    ("● 正常模式", egui::Color32::from_rgb(38, 166, 91))
+                };
+                ui.colored_label(color, label);
+            });
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for tab in [TimerPageTab::Monitor, TimerPageTab::Editor] {
+                ui.selectable_value(&mut self.timer_page_tab, tab, tab.label());
             }
         });
-
         ui.separator();
-        ui.heading("计划模板");
-        if self.standby_templates.is_empty() {
-            ui.label("暂无模板");
-        } else {
-            let selected_name = self
-                .selected_template()
-                .map(|template| template.name.as_str())
-                .unwrap_or("未选择");
-            egui::ComboBox::from_id_salt("standby_plan_templates")
-                .selected_text(selected_name)
-                .show_ui(ui, |ui| {
-                    for (idx, template) in self.standby_templates.iter().enumerate() {
-                        ui.selectable_value(
-                            &mut self.selected_standby_template,
-                            idx,
-                            template.name.as_str(),
-                        );
-                    }
-                });
 
-            ui.horizontal(|ui| {
-                if ui.button("应用模板").clicked() {
+        match self.timer_page_tab {
+            TimerPageTab::Monitor => self.draw_timer_monitor(ui),
+            TimerPageTab::Editor => self.draw_timer_editor(ui),
+        }
+    }
+
+    fn draw_timer_monitor(&mut self, ui: &mut egui::Ui) {
+        if let Some(plan) = self.standby_timer.clone() {
+            self.draw_plan_run_status(ui, &plan);
+            ui.add_space(10.0);
+            ui.columns(2, |columns| {
+                self.draw_plan_queue_panel(&mut columns[0], &plan);
+                self.draw_plan_result_panel(&mut columns[1]);
+            });
+        } else {
+            ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.heading("当前没有运行中的计划");
+                ui.label("选择一个模板即可开始，运行后可在这里查看倒计时和执行队列。");
+                ui.add_space(8.0);
+                self.draw_template_selector(ui, "monitor_template_selector");
+                let can_start = self
+                    .selected_template()
+                    .is_some_and(|template| !template.items.is_empty());
+                let start_button = egui::Button::new("▶ 立即运行")
+                    .fill(ui.visuals().selection.bg_fill)
+                    .min_size(egui::vec2(120.0, 34.0));
+                if ui.add_enabled(can_start, start_button).clicked() {
                     self.start_selected_template();
                 }
-                if ui.button("追加到队列").clicked() {
-                    self.append_selected_template();
-                }
-                if ui.button("保存自定义").clicked() {
-                    self.save_selected_custom_template();
-                }
-                if ui.button("清空模板步骤").clicked() {
-                    self.clear_selected_custom_template_items();
-                }
-                if ui.button("一键删除模板").clicked() {
-                    self.delete_selected_custom_template();
+                if !can_start {
+                    ui.small("所选模板没有步骤，请先到“计划编辑”中添加步骤。");
                 }
             });
 
+            if self.standby_plan_result.status != PlanResultStatus::Idle {
+                ui.add_space(10.0);
+                self.draw_plan_result_panel(ui);
+            }
+        }
+
+        if !self.standby_timer_message.is_empty() {
+            ui.add_space(8.0);
+            draw_feedback(ui, &self.standby_timer_message);
+        }
+    }
+
+    fn draw_timer_editor(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.heading("模板库");
+            self.draw_template_selector(ui, "editor_template_selector");
+            ui.add_space(6.0);
+
+            let has_items = self
+                .selected_template()
+                .is_some_and(|template| !template.items.is_empty());
+            let is_custom = self
+                .selected_template()
+                .is_some_and(|template| template.is_custom);
+            ui.horizontal_wrapped(|ui| {
+                let run_button =
+                    egui::Button::new("▶ 立即运行").fill(ui.visuals().selection.bg_fill);
+                if ui.add_enabled(has_items, run_button).clicked() {
+                    self.start_selected_template();
+                }
+
+                let append = ui
+                    .add_enabled(
+                        self.standby_timer.is_some() && has_items,
+                        egui::Button::new("追加到运行队列"),
+                    )
+                    .on_hover_text("仅在已有计划运行时可追加");
+                if append.clicked() {
+                    self.append_selected_template();
+                }
+
+                if ui
+                    .add_enabled(is_custom, egui::Button::new("保存修改"))
+                    .clicked()
+                {
+                    self.save_selected_custom_template();
+                }
+            });
+
+            egui::CollapsingHeader::new("新建或复制模板")
+                .id_salt("create_or_copy_template")
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("新模板名称");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.new_template_name_input)
+                                .desired_width(180.0),
+                        );
+                        if ui.button("新建空模板").clicked() {
+                            self.create_empty_custom_template();
+                        }
+                        if ui.button("复制所选模板").clicked() {
+                            self.copy_selected_template_as_custom();
+                        }
+                    });
+                });
+        });
+
+        if self.standby_templates.is_empty() {
+            ui.label("暂无模板，请先新建一个自定义模板。");
+        } else {
+            ui.add_space(10.0);
             self.draw_selected_template_editor(ui);
         }
-        if !self.standby_timer_message.is_empty() {
-            ui.label(&self.standby_timer_message);
-        }
+
         if !self.template_edit_message.is_empty() {
-            ui.label(&self.template_edit_message);
+            ui.add_space(8.0);
+            draw_feedback(ui, &self.template_edit_message);
+        }
+    }
+
+    fn draw_template_selector(&mut self, ui: &mut egui::Ui, id: &'static str) {
+        if self.standby_templates.is_empty() {
+            ui.label("暂无可用模板");
+            return;
+        }
+
+        let selected_name = self
+            .selected_template()
+            .map(|template| template.name.clone())
+            .unwrap_or_else(|| "未选择".to_string());
+        let previous_selection = self.selected_standby_template;
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(selected_name)
+            .width(240.0)
+            .show_ui(ui, |ui| {
+                for (idx, template) in self.standby_templates.iter().enumerate() {
+                    let kind = if template.is_custom {
+                        "自定义"
+                    } else {
+                        "内置"
+                    };
+                    ui.selectable_value(
+                        &mut self.selected_standby_template,
+                        idx,
+                        format!("{} · {kind}", template.name),
+                    );
+                }
+            });
+        if self.selected_standby_template != previous_selection {
+            self.template_delete_confirmation = false;
         }
     }
 
     fn draw_plan_result_panel(&self, ui: &mut egui::Ui) {
         let stats = &self.standby_plan_result;
 
-        ui.separator();
         ui.group(|ui| {
-            ui.heading("定时计划总结果");
+            ui.set_min_width(ui.available_width());
+            ui.heading(if stats.status == PlanResultStatus::Running {
+                "实时统计"
+            } else {
+                "最近一次结果"
+            });
             ui.horizontal_wrapped(|ui| {
-                ui.label("结果");
                 let color = match stats.status {
                     PlanResultStatus::Completed if stats.alarm_frames == 0 => {
                         egui::Color32::from_rgb(38, 166, 91)
@@ -1604,146 +1727,198 @@ impl SerialPanelApp {
                     PlanResultStatus::Interrupted => egui::Color32::from_rgb(245, 158, 11),
                     _ => ui.visuals().text_color(),
                 };
-                ui.colored_label(color, stats.result_label());
-                ui.separator();
-                ui.label(format!("状态: {}", stats.status.label()));
+                ui.colored_label(color, egui::RichText::new(stats.result_label()).strong());
+                ui.label(format!("· {}", stats.status.label()));
             });
 
             if stats.status == PlanResultStatus::Idle {
-                ui.label("尚未运行定时计划");
+                ui.label("计划开始后，这里将显示检测统计。");
                 return;
             }
 
-            ui.label(format!("模板: {}", stats.template_name));
-            ui.label("统计范围: 只统计正常模式阶段收到的状态帧，待机阶段不计入");
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("统计帧数: {}", stats.checked_frames));
-                ui.separator();
-                ui.label(format!("报警帧数: {}", stats.alarm_frames));
-                ui.separator();
-                ui.label(format!("报警点数: {}", stats.alarm_points));
-                ui.separator();
-                ui.label(format!("统计用时: {}", format_duration(stats.elapsed_duration())));
+            ui.small(format!("模板：{}", stats.template_name));
+            ui.add_space(6.0);
+            ui.columns(3, |columns| {
+                columns[0].strong(stats.checked_frames.to_string());
+                columns[0].small("统计帧数");
+                columns[1].strong(stats.alarm_frames.to_string());
+                columns[1].small("报警帧数");
+                columns[2].strong(stats.alarm_points.to_string());
+                columns[2].small("报警点数");
             });
+            ui.add_space(6.0);
+            ui.label(format!(
+                "统计用时：{}",
+                format_duration(stats.elapsed_duration())
+            ));
+            ui.small("仅统计正常模式阶段收到的状态帧");
 
             if stats.last_alarm.is_empty() {
-                ui.label("最后报警: 无");
+                ui.label("最后报警：无");
             } else {
-                ui.label(format!("最后报警: {}", stats.last_alarm));
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 53, 69),
+                    format!("最后报警：{}", stats.last_alarm),
+                );
             }
 
             let port_axis_counts = stats.sorted_port_axis_counts();
-            ui.separator();
-            ui.label("各 COM / 轴位报警次数");
-            if port_axis_counts.is_empty() {
-                ui.label("暂无报警计数");
-            } else {
-                egui::Grid::new("plan_result_port_axis_counts")
-                    .num_columns(3)
-                    .spacing(egui::vec2(12.0, 6.0))
-                    .striped(true)
+            if !port_axis_counts.is_empty() {
+                egui::CollapsingHeader::new("查看各串口 / 轴位报警次数")
+                    .id_salt("plan_alarm_details")
                     .show(ui, |ui| {
-                        ui.strong("COM");
-                        ui.strong("轴位");
-                        ui.strong("次数");
-                        ui.end_row();
+                        egui::Grid::new("plan_result_port_axis_counts")
+                            .num_columns(3)
+                            .spacing(egui::vec2(12.0, 6.0))
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.strong("串口");
+                                ui.strong("轴位");
+                                ui.strong("次数");
+                                ui.end_row();
 
-                        for (port, sensor_idx, axis_idx, count) in port_axis_counts {
-                            ui.label(port);
-                            ui.label(format!("{}{}", SENSOR_NAMES[sensor_idx], AXIS_NAMES[axis_idx]));
-                            ui.label(count.to_string());
-                            ui.end_row();
-                        }
+                                for (port, sensor_idx, axis_idx, count) in port_axis_counts {
+                                    ui.label(port);
+                                    ui.label(format!(
+                                        "{}{}",
+                                        SENSOR_NAMES[sensor_idx], AXIS_NAMES[axis_idx]
+                                    ));
+                                    ui.label(count.to_string());
+                                    ui.end_row();
+                                }
+                            });
                     });
             }
         });
     }
 
-    fn draw_plan_run_status(&mut self, ui: &mut egui::Ui) {
-        let Some(plan) = &self.standby_timer else {
-            ui.label("计划状态: 未运行");
-            return;
-        };
+    fn draw_plan_run_status(&mut self, ui: &mut egui::Ui, plan: &StandbyPlanRun) {
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.heading(&plan.template_name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!(
+                        "已运行 {}",
+                        format_duration(plan.started_at.elapsed())
+                    ));
+                });
+            });
 
-        ui.label(format!(
-            "计划状态: {}，已完成 {} 个步骤，已运行 {}",
-            plan.template_name,
-            plan.completed_events,
-            format_duration(plan.started_at.elapsed())
-        ));
-        ui.label(format!(
-            "队列剩余: {}，结束后: {}",
-            format_duration(plan.pending_duration()),
-            plan.finish_action.label()
-        ));
+            let total_steps = plan.completed_events as usize
+                + plan.queue.len()
+                + usize::from(plan.current.is_some());
+            let completed = plan.completed_events;
 
-        if let Some(current) = &plan.current {
-            let elapsed = current
-                .started_at
-                .map_or(Duration::ZERO, |started| started.elapsed());
-            ui.label(format!(
-                "运行中: {} / {}，剩余 {}",
-                current.label,
-                current.stage.label(),
-                format_duration(duration_remaining(current.duration, elapsed))
-            ));
-        }
-
-        if ui.button("中断定时计划").clicked() {
-            self.interrupt_standby_timer();
-            return;
-        }
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!("计划队列: 等待 {} 步", plan.queue.len()));
-            let label = if self.plan_queue_expanded {
-                "折叠"
+            if let Some(current) = &plan.current {
+                let elapsed = current
+                    .started_at
+                    .map_or(Duration::ZERO, |started| started.elapsed());
+                let progress = if current.duration.is_zero() {
+                    1.0
+                } else {
+                    (elapsed.as_secs_f32() / current.duration.as_secs_f32()).clamp(0.0, 1.0)
+                };
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    draw_stage_badge(ui, current.stage);
+                    ui.strong(&current.label);
+                });
+                ui.label(
+                    egui::RichText::new(format_duration(duration_remaining(
+                        current.duration,
+                        elapsed,
+                    )))
+                    .size(30.0)
+                    .strong(),
+                );
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .desired_width(ui.available_width())
+                        .text(format!("当前步骤 {:.0}%", progress * 100.0)),
+                );
             } else {
-                "展开"
-            };
-            if ui.button(label).clicked() {
-                self.plan_queue_expanded = !self.plan_queue_expanded;
+                ui.label("正在准备下一步骤…");
             }
-        });
 
-        if self.plan_queue_expanded {
-            egui::Grid::new("standby_plan_queue")
-                .num_columns(4)
-                .spacing(egui::vec2(10.0, 6.0))
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("状态");
-                    ui.strong("步骤");
-                    ui.strong("模式");
-                    ui.strong("时长");
-                    ui.end_row();
-
-                    if let Some(current) = &plan.current {
-                        ui.label("运行中");
-                        ui.label(&current.label);
-                        ui.label(current.stage.label());
-                        ui.label(format_duration(current.duration));
-                        ui.end_row();
-                    }
-
-                    for event in &plan.queue {
-                        ui.label("等待中");
-                        ui.label(&event.label);
-                        ui.label(event.stage.label());
-                        ui.label(format_duration(event.duration));
-                        ui.end_row();
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("已完成 {completed}/{total_steps} 步"));
+                ui.separator();
+                ui.label(format!(
+                    "总剩余 {}",
+                    format_duration(plan.pending_duration())
+                ));
+                ui.separator();
+                ui.label(format!("结束后：{}", plan.finish_action.label()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let stop =
+                        egui::Button::new("中断计划").fill(egui::Color32::from_rgb(180, 55, 60));
+                    if ui.add(stop).clicked() {
+                        self.interrupt_standby_timer();
                     }
                 });
-        } else if let Some(next) = plan.queue.front() {
-            ui.label(format!(
-                "下一步: {} / {} / {}",
-                next.label,
-                next.stage.label(),
-                format_duration(next.duration)
-            ));
-        } else {
-            ui.label("等待队列为空");
-        }
+            });
+
+            if let Some(next) = plan.queue.front() {
+                ui.small(format!(
+                    "下一步：{} · {} · {}",
+                    next.label,
+                    next.stage.label(),
+                    format_duration(next.duration)
+                ));
+            }
+        });
+    }
+
+    fn draw_plan_queue_panel(&mut self, ui: &mut egui::Ui, plan: &StandbyPlanRun) {
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.heading("执行队列");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small(format!("等待 {} 步", plan.queue.len()));
+                });
+            });
+
+            if let Some(current) = &plan.current {
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(59, 130, 246), "▶");
+                    ui.strong(&current.label);
+                    draw_stage_badge(ui, current.stage);
+                });
+            }
+
+            let visible_count = if self.plan_queue_expanded {
+                plan.queue.len()
+            } else {
+                4
+            };
+            for event in plan.queue.iter().take(visible_count) {
+                ui.horizontal(|ui| {
+                    ui.label("○");
+                    ui.label(&event.label);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.small(format_duration(event.duration));
+                        ui.small(event.stage.label());
+                    });
+                });
+            }
+
+            if plan.queue.is_empty() {
+                ui.small("没有等待中的步骤");
+            } else if plan.queue.len() > 4 {
+                let hidden = plan.queue.len().saturating_sub(4);
+                let label = if self.plan_queue_expanded {
+                    "收起队列".to_string()
+                } else {
+                    format!("展开其余 {hidden} 步")
+                };
+                if ui.small_button(label).clicked() {
+                    self.plan_queue_expanded = !self.plan_queue_expanded;
+                }
+            }
+        });
     }
 
     fn draw_selected_template_editor(&mut self, ui: &mut egui::Ui) {
@@ -1752,219 +1927,337 @@ impl SerialPanelApp {
         };
         let is_custom = template.is_custom;
         let items_snapshot = template.items.clone();
+        let finish_action = template.finish_action;
+        let total_duration = items_snapshot
+            .iter()
+            .fold(Duration::ZERO, |total, item| total + item.duration);
 
-        if is_custom {
-            if let Some(template) = self.selected_template_mut() {
-                ui.horizontal(|ui| {
-                    ui.label("名称");
-                    ui.add(egui::TextEdit::singleline(&mut template.name).desired_width(130.0));
-                    egui::ComboBox::from_id_salt("template_finish_action")
-                        .selected_text(template.finish_action.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut template.finish_action,
-                                PlanFinishAction::Normal,
-                                PlanFinishAction::Normal.label(),
-                            );
-                            ui.selectable_value(
-                                &mut template.finish_action,
-                                PlanFinishAction::Standby,
-                                PlanFinishAction::Standby.label(),
-                            );
-                            ui.selectable_value(
-                                &mut template.finish_action,
-                                PlanFinishAction::KeepLast,
-                                PlanFinishAction::KeepLast.label(),
-                            );
-                        });
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.heading("模板设置");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small(if is_custom {
+                        "自定义模板"
+                    } else {
+                        "内置模板 · 只读"
+                    });
                 });
-            }
-        } else {
-            ui.label("内置模板只读，可复制为自定义模板后编辑");
-            ui.label(format!("结束后: {}", template.finish_action.label()));
-        }
+            });
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!("模板步骤: {} 步", items_snapshot.len()));
-            let label = if self.template_items_expanded {
-                "折叠"
-            } else {
-                "展开"
-            };
-            if ui.button(label).clicked() {
-                self.template_items_expanded = !self.template_items_expanded;
-            }
-        });
-        if self.template_items_expanded {
-            egui::Grid::new("template_items_grid")
-                .num_columns(5)
-                .spacing(egui::vec2(8.0, 6.0))
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("步骤");
-                    ui.strong("模式");
-                    ui.strong("时长");
-                    ui.strong("排序");
-                    ui.strong("操作");
-                    ui.end_row();
-
-                    for (idx, item) in items_snapshot.iter().enumerate() {
-                        ui.label(&item.label);
-                        ui.label(item.stage.label());
-                        ui.label(format_duration(item.duration));
-                        if is_custom {
-                            ui.horizontal(|ui| {
-                                if ui.button("上").clicked() {
-                                    self.move_template_item(idx, -1);
-                                }
-                                if ui.button("下").clicked() {
-                                    self.move_template_item(idx, 1);
-                                }
+            if is_custom {
+                if let Some(template) = self.selected_template_mut() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("模板名称");
+                        ui.add(egui::TextEdit::singleline(&mut template.name).desired_width(190.0));
+                        ui.label("结束后");
+                        egui::ComboBox::from_id_salt("template_finish_action")
+                            .selected_text(template.finish_action.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut template.finish_action,
+                                    PlanFinishAction::Normal,
+                                    PlanFinishAction::Normal.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut template.finish_action,
+                                    PlanFinishAction::Standby,
+                                    PlanFinishAction::Standby.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut template.finish_action,
+                                    PlanFinishAction::KeepLast,
+                                    PlanFinishAction::KeepLast.label(),
+                                );
                             });
-                            if ui.button("删除").clicked() {
-                                self.remove_template_item(idx);
-                            }
-                        } else {
-                            ui.label("-");
-                            ui.label("-");
+                    });
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    if !self.template_delete_confirmation {
+                        if ui
+                            .add(
+                                egui::Button::new("删除模板")
+                                    .fill(egui::Color32::from_rgb(125, 45, 50)),
+                            )
+                            .clicked()
+                        {
+                            self.template_delete_confirmation = true;
                         }
-                        ui.end_row();
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 53, 69),
+                            "确定删除这个模板？",
+                        );
+                        if ui.button("确认删除").clicked() {
+                            self.delete_selected_custom_template();
+                            self.template_delete_confirmation = false;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.template_delete_confirmation = false;
+                        }
                     }
                 });
-        } else if let Some(item) = items_snapshot.first() {
-            ui.label(format!(
-                "首步: {} / {} / {}",
-                item.label,
-                item.stage.label(),
-                format_duration(item.duration)
-            ));
-        } else {
-            ui.label("模板暂无步骤");
-        }
+            } else {
+                ui.label("内置模板不能直接编辑，可在上方复制为自定义模板。");
+                ui.label(format!("结束后：{}", finish_action.label()));
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.heading("执行步骤");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small(format!(
+                        "共 {} 步 · 总时长 {}",
+                        items_snapshot.len(),
+                        format_duration(total_duration)
+                    ));
+                });
+            });
+
+            if items_snapshot.is_empty() {
+                ui.label("模板还没有步骤，请在下方添加第一个步骤。");
+            } else {
+                let visible_count = if self.template_items_expanded {
+                    items_snapshot.len()
+                } else {
+                    items_snapshot.len().min(6)
+                };
+                egui::Grid::new("template_items_grid")
+                    .num_columns(6)
+                    .spacing(egui::vec2(12.0, 7.0))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("#");
+                        ui.strong("步骤名称");
+                        ui.strong("模式");
+                        ui.strong("时长");
+                        ui.strong("排序");
+                        ui.strong("操作");
+                        ui.end_row();
+
+                        for (idx, item) in items_snapshot.iter().take(visible_count).enumerate() {
+                            ui.label((idx + 1).to_string());
+                            ui.label(&item.label);
+                            draw_stage_badge(ui, item.stage);
+                            ui.label(format_duration(item.duration));
+                            if is_custom {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("↑").clicked() {
+                                        self.move_template_item(idx, -1);
+                                    }
+                                    if ui.small_button("↓").clicked() {
+                                        self.move_template_item(idx, 1);
+                                    }
+                                });
+                                if ui.small_button("删除").clicked() {
+                                    self.remove_template_item(idx);
+                                }
+                            } else {
+                                ui.label("—");
+                                ui.label("—");
+                            }
+                            ui.end_row();
+                        }
+                    });
+
+                if items_snapshot.len() > 6 {
+                    let label = if self.template_items_expanded {
+                        "收起步骤"
+                    } else {
+                        "展开全部步骤"
+                    };
+                    if ui.small_button(label).clicked() {
+                        self.template_items_expanded = !self.template_items_expanded;
+                    }
+                }
+            }
+
+            if is_custom && !items_snapshot.is_empty() {
+                ui.separator();
+                if ui.button("清空全部步骤").clicked() {
+                    self.clear_selected_custom_template_items();
+                }
+            }
+        });
 
         if !is_custom {
             return;
         }
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("新增步骤");
-            egui::ComboBox::from_id_salt("template_item_stage")
-                .selected_text(self.template_item_stage.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.template_item_stage,
-                        StandbyTimerStage::Normal,
-                        StandbyTimerStage::Normal.label(),
-                    );
-                    ui.selectable_value(
-                        &mut self.template_item_stage,
-                        StandbyTimerStage::Standby,
-                        StandbyTimerStage::Standby.label(),
-                    );
-                });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.template_item_label_input).desired_width(96.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.template_item_hours_input).desired_width(36.0),
-            );
-            ui.label("时");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.template_item_minutes_input)
-                    .desired_width(36.0),
-            );
-            ui.label("分");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.template_item_seconds_input)
-                    .desired_width(36.0),
-            );
-            ui.label("秒");
-            ui.label("次数");
-            ui.add(
-                egui::DragValue::new(&mut self.template_item_repeat_count)
-                    .range(1..=MAX_TEMPLATE_ITEM_REPEAT_COUNT)
-                    .speed(1),
-            );
-            if ui.button("添加").clicked() {
-                self.add_item_to_selected_template();
-            }
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.heading("新步骤");
+            ui.small("设置一次步骤内容，再选择添加到主计划，或暂存到下方的循环步骤组。");
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("模式");
+                egui::ComboBox::from_id_salt("template_item_stage")
+                    .selected_text(self.template_item_stage.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.template_item_stage,
+                            StandbyTimerStage::Normal,
+                            StandbyTimerStage::Normal.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.template_item_stage,
+                            StandbyTimerStage::Standby,
+                            StandbyTimerStage::Standby.label(),
+                        );
+                    });
+                ui.label("名称");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.template_item_label_input)
+                        .desired_width(130.0),
+                );
+                ui.label("时长");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.template_item_hours_input)
+                        .desired_width(34.0),
+                );
+                ui.label("时");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.template_item_minutes_input)
+                        .desired_width(34.0),
+                );
+                ui.label("分");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.template_item_seconds_input)
+                        .desired_width(34.0),
+                );
+                ui.label("秒");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("添加到主计划时重复");
+                ui.add(
+                    egui::DragValue::new(&mut self.template_item_repeat_count)
+                        .range(1..=MAX_TEMPLATE_ITEM_REPEAT_COUNT)
+                        .suffix(" 次")
+                        .speed(1),
+                );
+                if ui.button("＋ 添加到主计划").clicked() {
+                    self.add_item_to_selected_template();
+                }
+                if ui.button("加入循环步骤组 ↓").clicked() {
+                    self.add_item_to_template_sub_plan();
+                }
+            });
         });
 
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.label("子计划步骤");
-            if ui.button("添加步骤到子计划").clicked() {
-                self.add_item_to_template_sub_plan();
-            }
-            ui.label(format!("当前 {} 步", self.template_sub_plan_items.len()));
-            let label = if self.template_sub_plan_expanded {
-                "折叠"
+        ui.add_space(10.0);
+        self.draw_loop_group_editor(ui);
+    }
+
+    fn draw_loop_group_editor(&mut self, ui: &mut egui::Ui) {
+        let items = self.template_sub_plan_items.clone();
+        let round_duration = items
+            .iter()
+            .fold(Duration::ZERO, |total, item| total + item.duration);
+        let repeat_count = self
+            .template_sub_plan_repeat_count
+            .clamp(1, MAX_TEMPLATE_ITEM_REPEAT_COUNT);
+        let generated_steps = items.len().saturating_mul(repeat_count);
+        let generated_duration = round_duration
+            .checked_mul(repeat_count as u32)
+            .unwrap_or(Duration::MAX);
+
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.heading("循环步骤组");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small("高级");
+                });
+            });
+            ui.label("适合“正常 10 分钟 → 待机 20 分钟”这类需要重复多轮的流程。");
+            ui.small("先用上方按钮组装一轮，确认顺序后设置循环次数；插入时会展开为普通步骤。");
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("一轮 {} 步", items.len()));
+                ui.separator();
+                ui.label(format!("一轮时长 {}", format_duration(round_duration)));
+                ui.separator();
+                ui.label(format!("循环 {repeat_count} 次"));
+                ui.separator();
+                ui.strong(format!(
+                    "最终生成 {generated_steps} 步 / {}",
+                    format_duration(generated_duration)
+                ));
+            });
+
+            if items.is_empty() {
+                ui.add_space(8.0);
+                ui.label("循环组为空，请先在上方设置步骤，然后点击“加入循环步骤组”。");
             } else {
-                "展开"
-            };
-            if ui.button(label).clicked() {
-                self.template_sub_plan_expanded = !self.template_sub_plan_expanded;
-            }
-            if ui.button("清空子计划").clicked() {
-                self.clear_template_sub_plan();
-            }
-        });
-
-        if self.template_sub_plan_items.is_empty() {
-            ui.label("子计划暂无步骤");
-        } else if self.template_sub_plan_expanded {
-            let sub_plan_snapshot = self.template_sub_plan_items.clone();
-            egui::Grid::new("template_sub_plan_items_grid")
-                .num_columns(5)
-                .spacing(egui::vec2(8.0, 6.0))
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("步骤");
-                    ui.strong("模式");
-                    ui.strong("时长");
-                    ui.strong("排序");
-                    ui.strong("操作");
-                    ui.end_row();
-
-                    for (idx, item) in sub_plan_snapshot.iter().enumerate() {
-                        ui.label(&item.label);
-                        ui.label(item.stage.label());
-                        ui.label(format_duration(item.duration));
-                        ui.horizontal(|ui| {
-                            if ui.button("上").clicked() {
-                                self.move_template_sub_plan_item(idx, -1);
-                            }
-                            if ui.button("下").clicked() {
-                                self.move_template_sub_plan_item(idx, 1);
-                            }
-                        });
-                        if ui.button("删除").clicked() {
-                            self.remove_template_sub_plan_item(idx);
-                        }
+                ui.add_space(8.0);
+                egui::Grid::new("template_loop_group_grid")
+                    .num_columns(6)
+                    .spacing(egui::vec2(12.0, 7.0))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("#");
+                        ui.strong("步骤名称");
+                        ui.strong("模式");
+                        ui.strong("时长");
+                        ui.strong("排序");
+                        ui.strong("操作");
                         ui.end_row();
-                    }
-                });
-        } else if let Some(item) = self.template_sub_plan_items.first() {
-            ui.label(format!(
-                "首步: {} / {} / {}",
-                item.label,
-                item.stage.label(),
-                format_duration(item.duration)
-            ));
-        }
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("添加子计划");
-            ui.label(format!("每轮 {} 步", self.template_sub_plan_items.len()));
-            ui.label("次数");
-            ui.add(
-                egui::DragValue::new(&mut self.template_sub_plan_repeat_count)
-                    .range(1..=MAX_TEMPLATE_ITEM_REPEAT_COUNT)
-                    .speed(1),
-            );
-            if ui.button("添加子计划").clicked() {
-                self.add_sub_plan_to_selected_template();
+                        for (idx, item) in items.iter().enumerate() {
+                            ui.label((idx + 1).to_string());
+                            ui.label(&item.label);
+                            draw_stage_badge(ui, item.stage);
+                            ui.label(format_duration(item.duration));
+                            ui.horizontal(|ui| {
+                                if ui.small_button("↑").clicked() {
+                                    self.move_template_sub_plan_item(idx, -1);
+                                }
+                                if ui.small_button("↓").clicked() {
+                                    self.move_template_sub_plan_item(idx, 1);
+                                }
+                            });
+                            if ui.small_button("移除").clicked() {
+                                self.remove_template_sub_plan_item(idx);
+                            }
+                            ui.end_row();
+                        }
+                    });
             }
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("循环次数");
+                ui.add(
+                    egui::DragValue::new(&mut self.template_sub_plan_repeat_count)
+                        .range(1..=MAX_TEMPLATE_ITEM_REPEAT_COUNT)
+                        .suffix(" 次")
+                        .speed(1),
+                );
+                ui.checkbox(
+                    &mut self.template_sub_plan_clear_after_insert,
+                    "插入后清空循环组",
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                let insert_button =
+                    egui::Button::new(format!("插入主计划（生成 {generated_steps} 步）"))
+                        .fill(ui.visuals().selection.bg_fill);
+                if ui.add_enabled(!items.is_empty(), insert_button).clicked() {
+                    self.add_sub_plan_to_selected_template();
+                }
+                if ui
+                    .add_enabled(!items.is_empty(), egui::Button::new("清空循环组"))
+                    .clicked()
+                {
+                    self.clear_template_sub_plan();
+                }
+            });
         });
     }
 
@@ -2236,6 +2529,31 @@ fn draw_state_badge(ui: &mut egui::Ui, state: AlarmState) {
         .stroke(egui::Stroke::new(1.0, color))
         .min_size(egui::vec2(82.0, 32.0));
     ui.add_enabled(false, button);
+}
+
+fn draw_stage_badge(ui: &mut egui::Ui, stage: StandbyTimerStage) {
+    let color = match stage {
+        StandbyTimerStage::Normal => egui::Color32::from_rgb(38, 166, 91),
+        StandbyTimerStage::Standby => egui::Color32::from_rgb(245, 158, 11),
+    };
+    ui.label(
+        egui::RichText::new(stage.label())
+            .color(color)
+            .background_color(color.gamma_multiply(0.14)),
+    );
+}
+
+fn draw_feedback(ui: &mut egui::Ui, message: &str) {
+    let is_error = ["失败", "不能", "不能为空", "无效", "至少", "没有可"]
+        .iter()
+        .any(|keyword| message.contains(keyword));
+    let color = if is_error {
+        egui::Color32::from_rgb(220, 53, 69)
+    } else {
+        egui::Color32::from_rgb(38, 166, 91)
+    };
+    let prefix = if is_error { "!" } else { "✓" };
+    ui.colored_label(color, format!("{prefix} {message}"));
 }
 
 fn count_alarm_points(states: &[[AlarmState; 3]; 3]) -> u64 {
@@ -2709,12 +3027,21 @@ fn main() -> eframe::Result<()> {
     let manager = SerialManager::new();
     manager.start(event_tx);
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([960.0, 640.0]),
+        ..Default::default()
+    };
     let app_creator = move |cc: &eframe::CreationContext<'_>| -> Result<
         Box<dyn eframe::App>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         setup_chinese_fonts(&cc.egui_ctx);
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        cc.egui_ctx.set_style(style);
         Ok(Box::new(SerialPanelApp::new(manager.clone(), event_rx)))
     };
 
