@@ -2208,21 +2208,19 @@ impl eframe::App for SerialPanelApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("main_content_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Keep the plan controls in the visible central area. A pair of
+                    // unconstrained horizontal columns lets the overview consume the
+                    // available width and pushes the template controls off-screen.
+                    self.draw_timer_mode(ui);
+                    ui.add_space(12.0);
+                    ui.separator();
                     self.draw_overview(ui);
                     self.draw_self_test_overview(ui);
                 });
-                ui.separator();
-                ui.vertical(|ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("timer_mode_scroll")
-                        .max_height(ui.available_height())
-                        .show(ui, |ui| {
-                            self.draw_timer_mode(ui);
-                        });
-                });
-            });
         });
         self.draw_port_windows(ctx);
 
