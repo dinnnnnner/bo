@@ -115,6 +115,20 @@ impl SerialManager {
         names.sort();
         names
     }
+
+    #[cfg(test)]
+    pub fn add_test_port(&self, name: &str) -> impl Fn() -> Vec<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        self.ports.lock().unwrap().insert(name.to_string(), tx);
+        move || {
+            rx.try_iter()
+                .filter_map(|command| match command {
+                    PortCommand::Write(data) => Some(data),
+                    PortCommand::Shutdown => None,
+                })
+                .collect()
+        }
+    }
 }
 
 fn remove_missing_ports(

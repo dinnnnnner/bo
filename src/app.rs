@@ -11,6 +11,9 @@ use std::{
 use crate::protocol::{AlarmState, FrameParser, ParsedFrameKind, SensorFrame};
 use crate::serial::{BAUD_RATE, PortEvent, SerialManager};
 
+#[cfg(test)]
+mod tests;
+
 const MAX_LOG_LINES: usize = 300;
 const AUTO_LOG_DIR: &str = "logs/auto";
 const CURRENT_LOG_DIR: &str = "logs/current";
@@ -19,6 +22,10 @@ const FRAME_TAIL: [u8; 2] = [0x55, 0xAA];
 const THRESHOLD_FRAME_HEAD: [u8; 3] = [0xAA, 0x55, 0x01];
 const SELF_TEST_START_FRAME: &[u8] = &[0xAA, 0x55, 0x02, 0x55, 0xAA];
 const SELF_TEST_STOP_FRAME: &[u8] = &[0xAA, 0x55, 0x03, 0x55, 0xAA];
+const VIBRATION_START_FRAME: &[u8] = &[0xAA, 0x55, 0x08, 0x55, 0xAA];
+const VIBRATION_STOP_FRAME: &[u8] = &[0xAA, 0x55, 0x09, 0x55, 0xAA];
+const ENVIRONMENT_START_FRAME: &[u8] = &[0xAA, 0x55, 0x06, 0x55, 0xAA];
+const ENVIRONMENT_STOP_FRAME: &[u8] = &[0xAA, 0x55, 0x07, 0x55, 0xAA];
 const STANDBY_START_FRAME: &[u8] = &[0xAA, 0x55, 0x04, 0x55, 0xAA];
 const STANDBY_STOP_FRAME: &[u8] = &[0xAA, 0x55, 0x05, 0x55, 0xAA];
 const SENSOR_NAMES: [&str; 3] = ["S1", "S2", "S3"];
@@ -33,6 +40,36 @@ enum SelfTestAction {
 }
 
 impl SelfTestAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "开始",
+            Self::Stop => "停止",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VibrationAction {
+    Start,
+    Stop,
+}
+
+impl VibrationAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "开始",
+            Self::Stop => "停止",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EnvironmentAction {
+    Start,
+    Stop,
+}
+
+impl EnvironmentAction {
     fn label(self) -> &'static str {
         match self {
             Self::Start => "开始",
@@ -231,6 +268,11 @@ struct PlanResultStats {
     started_at: Option<Instant>,
     elapsed: Duration,
     checked_frames: u64,
+    invalid_frames: u64,
+    expected_ports: HashSet<String>,
+    stage_seen_ports: HashSet<String>,
+    normal_stage_active: bool,
+    incomplete: bool,
     alarm_frames: u64,
     alarm_points: u64,
     port_axis_alarm_counts: HashMap<String, [[u64; 3]; 3]>,
@@ -245,6 +287,11 @@ impl Default for PlanResultStats {
             started_at: None,
             elapsed: Duration::ZERO,
             checked_frames: 0,
+            invalid_frames: 0,
+            expected_ports: HashSet::new(),
+            stage_seen_ports: HashSet::new(),
+            normal_stage_active: false,
+            incomplete: false,
             alarm_frames: 0,
             alarm_points: 0,
             port_axis_alarm_counts: HashMap::new(),
@@ -254,16 +301,18 @@ impl Default for PlanResultStats {
 }
 
 impl PlanResultStats {
-    fn start(&mut self, template_name: impl Into<String>) {
+    fn start(&mut self, template_name: impl Into<String>, ports: &HashSet<String>) {
         *self = Self {
             status: PlanResultStatus::Running,
             template_name: template_name.into(),
             started_at: Some(Instant::now()),
+            expected_ports: ports.clone(),
             ..Self::default()
         };
     }
 
     fn finish(&mut self, status: PlanResultStatus) {
+        self.finish_normal_stage();
         if self.status == PlanResultStatus::Running {
             self.elapsed = self
                 .started_at
@@ -272,12 +321,55 @@ impl PlanResultStats {
         self.status = status;
     }
 
+    fn begin_normal_stage(&mut self) {
+        self.stage_seen_ports.clear();
+        self.normal_stage_active = true;
+    }
+
+    fn finish_normal_stage(&mut self) {
+        if self.normal_stage_active {
+            self.incomplete |= self.stage_seen_ports.is_empty()
+                || !self.expected_ports.is_subset(&self.stage_seen_ports);
+            self.normal_stage_active = false;
+        }
+    }
+
+    fn port_connected(&mut self, port: &str) {
+        if self.status == PlanResultStatus::Running {
+            self.expected_ports.insert(port.to_string());
+        }
+    }
+
+    fn port_disconnected(&mut self, port: &str) {
+        if self.normal_stage_active && self.expected_ports.contains(port) {
+            self.incomplete = true;
+        }
+    }
+
+    fn passed(&self) -> bool {
+        self.status == PlanResultStatus::Completed
+            && self.checked_frames > 0
+            && self.invalid_frames == 0
+            && self.alarm_frames == 0
+            && !self.incomplete
+    }
+
     fn record_normal_frame(&mut self, port: &str, states: &[[AlarmState; 3]; 3]) {
-        if self.status != PlanResultStatus::Running {
+        if self.status != PlanResultStatus::Running || !self.normal_stage_active {
             return;
         }
 
         self.checked_frames = self.checked_frames.saturating_add(1);
+        self.expected_ports.insert(port.to_string());
+        if states
+            .iter()
+            .flatten()
+            .any(|state| matches!(state, AlarmState::Invalid(_)))
+        {
+            self.invalid_frames = self.invalid_frames.saturating_add(1);
+        } else {
+            self.stage_seen_ports.insert(port.to_string());
+        }
         let alarm_points = count_alarm_points(states);
         if alarm_points == 0 {
             return;
@@ -335,8 +427,11 @@ impl PlanResultStats {
             PlanResultStatus::Idle => "暂无结果",
             PlanResultStatus::Running => "统计中",
             PlanResultStatus::Interrupted => "已中断",
-            PlanResultStatus::Completed if self.alarm_frames == 0 => "通过",
-            PlanResultStatus::Completed => "有报警",
+            PlanResultStatus::Completed if self.alarm_frames > 0 => "有报警",
+            PlanResultStatus::Completed if self.invalid_frames > 0 => "数据无效",
+            PlanResultStatus::Completed if self.checked_frames == 0 => "无有效数据",
+            PlanResultStatus::Completed if self.incomplete => "检测不完整",
+            PlanResultStatus::Completed => "通过",
         }
     }
 }
@@ -352,6 +447,8 @@ struct SerialPanelApp {
     threshold_inputs: [String; 6],
     threshold_message: String,
     self_test_message: String,
+    vibration_message: String,
+    environment_message: String,
     standby_message: String,
     latest_frames: HashMap<String, SensorFrame>,
     self_test_frames: HashMap<String, SensorFrame>,
@@ -398,6 +495,8 @@ impl SerialPanelApp {
             threshold_inputs: std::array::from_fn(|_| "0".to_string()),
             threshold_message: String::new(),
             self_test_message: String::new(),
+            vibration_message: String::new(),
+            environment_message: String::new(),
             standby_message: String::new(),
             latest_frames: HashMap::new(),
             self_test_frames: HashMap::new(),
@@ -445,7 +544,9 @@ impl SerialPanelApp {
     }
 
     fn append_auto_log(&self, line: &str) -> io::Result<()> {
-        fs::create_dir_all(AUTO_LOG_DIR)?;
+        if let Some(parent) = self.auto_log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -465,10 +566,22 @@ impl SerialPanelApp {
             match event {
                 PortEvent::Connected(port) => {
                     self.connected_ports.insert(port.clone());
+                    self.standby_plan_result.port_connected(&port);
                     if self.selected_port.is_empty() {
                         self.selected_port = port.clone();
                     }
                     self.push_log(format!("{port} 已连接"));
+                    let mode_frame = if self.standby_active {
+                        STANDBY_START_FRAME
+                    } else {
+                        STANDBY_STOP_FRAME
+                    };
+                    if let Err(err) = self.manager.send_to(&port, mode_frame) {
+                        self.standby_plan_result.port_disconnected(&port);
+                        self.push_log(format!("{port} 模式同步失败: {err}"));
+                    } else {
+                        self.push_log(format!("{port} 当前模式同步命令已入队"));
+                    }
                 }
                 PortEvent::Data { port, data } => {
                     if self.standby_active {
@@ -528,6 +641,7 @@ impl SerialPanelApp {
                     }
                 }
                 PortEvent::Disconnected { port, reason } => {
+                    self.standby_plan_result.port_disconnected(&port);
                     self.connected_ports.remove(&port);
                     self.parsers.remove(&port);
                     self.latest_frames.remove(&port);
@@ -617,6 +731,28 @@ impl SerialPanelApp {
         self.push_log(self.self_test_message.clone());
     }
 
+    fn send_vibration_frame(&mut self, action: VibrationAction) {
+        let frame = match action {
+            VibrationAction::Start => VIBRATION_START_FRAME,
+            VibrationAction::Stop => VIBRATION_STOP_FRAME,
+        };
+        let hex = hex_string(frame);
+        self.manager.send_all(frame.to_vec());
+        self.vibration_message = format!("{}振动帧已发送到全部串口: {hex}", action.label());
+        self.push_log(self.vibration_message.clone());
+    }
+
+    fn send_environment_frame(&mut self, action: EnvironmentAction) {
+        let frame = match action {
+            EnvironmentAction::Start => ENVIRONMENT_START_FRAME,
+            EnvironmentAction::Stop => ENVIRONMENT_STOP_FRAME,
+        };
+        let hex = hex_string(frame);
+        self.manager.send_all(frame.to_vec());
+        self.environment_message = format!("{}环境帧已发送到全部串口: {hex}", action.label());
+        self.push_log(self.environment_message.clone());
+    }
+
     fn send_standby_frame(&mut self, action: StandbyAction) {
         let frame = match action {
             StandbyAction::Start => STANDBY_START_FRAME,
@@ -683,7 +819,8 @@ impl SerialPanelApp {
             return;
         }
 
-        self.standby_plan_result.start(template.name.clone());
+        self.standby_plan_result
+            .start(template.name.clone(), &self.connected_ports);
         self.standby_timer = Some(StandbyPlanRun::from_template(&template));
         self.start_next_plan_event();
     }
@@ -709,6 +846,7 @@ impl SerialPanelApp {
     }
 
     fn start_next_plan_event(&mut self) {
+        self.standby_plan_result.finish_normal_stage();
         let next_event = {
             let Some(plan) = self.standby_timer.as_mut() else {
                 return;
@@ -729,6 +867,9 @@ impl SerialPanelApp {
             event
         };
 
+        if next_event.stage == StandbyTimerStage::Normal {
+            self.standby_plan_result.begin_normal_stage();
+        }
         self.apply_mode_stage(next_event.stage);
         self.standby_timer_message = format!(
             "正在执行: {} / {}，时长 {}",
@@ -1367,11 +1508,15 @@ impl SerialPanelApp {
             });
             ui.horizontal_wrapped(|ui| {
                 let color = match stats.status {
-                    PlanResultStatus::Completed if stats.alarm_frames == 0 => {
+                    PlanResultStatus::Completed if stats.passed() => {
                         egui::Color32::from_rgb(38, 166, 91)
                     }
-                    PlanResultStatus::Completed => egui::Color32::from_rgb(220, 53, 69),
-                    PlanResultStatus::Interrupted => egui::Color32::from_rgb(245, 158, 11),
+                    PlanResultStatus::Completed if stats.alarm_frames > 0 => {
+                        egui::Color32::from_rgb(220, 53, 69)
+                    }
+                    PlanResultStatus::Completed | PlanResultStatus::Interrupted => {
+                        egui::Color32::from_rgb(245, 158, 11)
+                    }
                     _ => ui.visuals().text_color(),
                 };
                 ui.colored_label(color, egui::RichText::new(stats.result_label()).strong());
@@ -1399,6 +1544,13 @@ impl SerialPanelApp {
                 format_duration(stats.elapsed_duration())
             ));
             ui.small("仅统计正常模式阶段收到的状态帧");
+            ui.label(format!("无效帧数：{}", stats.invalid_frames));
+            if stats.incomplete {
+                ui.colored_label(
+                    egui::Color32::from_rgb(245, 158, 11),
+                    "检测不完整：正常阶段有串口断连或缺少有效数据",
+                );
+            }
 
             if stats.last_alarm.is_empty() {
                 ui.label("最后报警：无");
@@ -1625,7 +1777,7 @@ impl SerialPanelApp {
                         if ui
                             .add(
                                 egui::Button::new("删除模板")
-                                    .fill(egui::Color32::from_rgb(125, 45, 50)),
+                                    .fill(egui::Color32::from_rgb(255, 0, 255)),
                             )
                             .clicked()
                         {
@@ -2046,97 +2198,134 @@ impl eframe::App for SerialPanelApp {
             .resizable(false)
             .default_width(330.0)
             .show(ctx, |ui| {
-                ui.heading("串口");
-                let ports = self.manager.list_ports();
-                egui::ComboBox::from_id_salt("serial_ports")
-                    .selected_text(if self.selected_port.is_empty() {
-                        "未选择".to_string()
-                    } else {
-                        self.selected_port.clone()
-                    })
-                    .show_ui(ui, |ui| {
-                        for port in &ports {
-                            ui.selectable_value(&mut self.selected_port, port.clone(), port);
-                        }
-                    });
-
-                ui.add_space(12.0);
-                ui.heading("发送");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.send_as_hex, true, "HEX");
-                    ui.radio_value(&mut self.send_as_hex, false, "文本");
-                });
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.send_text)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(4),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("发送到选中串口").clicked() {
-                        self.send_current(false);
-                    }
-                    if ui.button("发送到全部").clicked() {
-                        self.send_current(true);
-                    }
-                });
-                if !self.invalid_send_message.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 53, 69),
-                        &self.invalid_send_message,
-                    );
-                }
-
-                ui.separator();
-                ui.heading("阈值设置");
-                egui::Grid::new("threshold_grid")
-                    .num_columns(2)
-                    .spacing(egui::vec2(10.0, 8.0))
+                egui::ScrollArea::vertical()
+                    .id_salt("controls_scroll")
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (idx, label) in THRESHOLD_LABELS.iter().enumerate() {
-                            ui.label(*label);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.threshold_inputs[idx])
-                                    .desired_width(96.0),
+                        ui.heading("串口");
+                        let ports = self.manager.list_ports();
+                        egui::ComboBox::from_id_salt("serial_ports")
+                            .selected_text(if self.selected_port.is_empty() {
+                                "未选择".to_string()
+                            } else {
+                                self.selected_port.clone()
+                            })
+                            .show_ui(ui, |ui| {
+                                for port in &ports {
+                                    ui.selectable_value(
+                                        &mut self.selected_port,
+                                        port.clone(),
+                                        port,
+                                    );
+                                }
+                            });
+
+                        ui.add_space(12.0);
+                        ui.heading("发送");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.send_as_hex, true, "HEX");
+                            ui.radio_value(&mut self.send_as_hex, false, "文本");
+                        });
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.send_text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(4),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button("发送到选中串口").clicked() {
+                                self.send_current(false);
+                            }
+                            if ui.button("发送到全部").clicked() {
+                                self.send_current(true);
+                            }
+                        });
+                        if !self.invalid_send_message.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 53, 69),
+                                &self.invalid_send_message,
                             );
-                            ui.end_row();
+                        }
+
+                        ui.separator();
+                        ui.heading("阈值设置");
+                        egui::Grid::new("threshold_grid")
+                            .num_columns(2)
+                            .spacing(egui::vec2(10.0, 8.0))
+                            .show(ui, |ui| {
+                                for (idx, label) in THRESHOLD_LABELS.iter().enumerate() {
+                                    ui.label(*label);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.threshold_inputs[idx])
+                                            .desired_width(96.0),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                        if ui.button("设置阈值到全部串口").clicked() {
+                            self.send_thresholds_to_all();
+                        }
+                        if !self.threshold_message.is_empty() {
+                            ui.label(&self.threshold_message);
+                        }
+
+                        ui.separator();
+                        ui.heading("自检");
+                        ui.horizontal(|ui| {
+                            if ui.button("开始自检").clicked() {
+                                self.send_self_test_frame(SelfTestAction::Start);
+                            }
+                            if ui.button("停止自检").clicked() {
+                                self.send_self_test_frame(SelfTestAction::Stop);
+                            }
+                        });
+                        if !self.self_test_message.is_empty() {
+                            ui.label(&self.self_test_message);
+                        }
+
+                        ui.separator();
+                        ui.heading("振动开始/停止");
+                        ui.horizontal(|ui| {
+                            if ui.button("开始").clicked() {
+                                self.send_vibration_frame(VibrationAction::Start);
+                            }
+                            if ui.button("停止").clicked() {
+                                self.send_vibration_frame(VibrationAction::Stop);
+                            }
+                        });
+                        if !self.vibration_message.is_empty() {
+                            ui.label(&self.vibration_message);
+                        }
+
+                        ui.separator();
+                        ui.heading("环境开始/停止");
+                        ui.horizontal(|ui| {
+                            if ui.button("开始").clicked() {
+                                self.send_environment_frame(EnvironmentAction::Start);
+                            }
+                            if ui.button("停止").clicked() {
+                                self.send_environment_frame(EnvironmentAction::Stop);
+                            }
+                        });
+                        if !self.environment_message.is_empty() {
+                            ui.label(&self.environment_message);
+                        }
+
+                        ui.separator();
+                        ui.heading("待机开始/停止");
+                        ui.horizontal(|ui| {
+                            if ui.button("开始").clicked() {
+                                self.stop_standby_timer();
+                                self.send_standby_frame(StandbyAction::Start);
+                            }
+                            if ui.button("停止").clicked() {
+                                self.stop_standby_timer();
+                                self.send_standby_frame(StandbyAction::Stop);
+                            }
+                        });
+                        if !self.standby_message.is_empty() {
+                            ui.label(&self.standby_message);
                         }
                     });
-                if ui.button("设置阈值到全部串口").clicked() {
-                    self.send_thresholds_to_all();
-                }
-                if !self.threshold_message.is_empty() {
-                    ui.label(&self.threshold_message);
-                }
-
-                ui.separator();
-                ui.heading("自检");
-                ui.horizontal(|ui| {
-                    if ui.button("开始自检").clicked() {
-                        self.send_self_test_frame(SelfTestAction::Start);
-                    }
-                    if ui.button("停止自检").clicked() {
-                        self.send_self_test_frame(SelfTestAction::Stop);
-                    }
-                });
-                if !self.self_test_message.is_empty() {
-                    ui.label(&self.self_test_message);
-                }
-
-                ui.separator();
-                ui.heading("待机模式");
-                ui.horizontal(|ui| {
-                    if ui.button("开始待机").clicked() {
-                        self.stop_standby_timer();
-                        self.send_standby_frame(StandbyAction::Start);
-                    }
-                    if ui.button("停止待机").clicked() {
-                        self.stop_standby_timer();
-                        self.send_standby_frame(StandbyAction::Stop);
-                    }
-                });
-                if !self.standby_message.is_empty() {
-                    ui.label(&self.standby_message);
-                }
             });
 
         egui::TopBottomPanel::bottom("logs_panel")
@@ -2173,7 +2362,7 @@ fn draw_state_badge(ui: &mut egui::Ui, state: AlarmState) {
     let color = state.color();
     let button = egui::Button::new(text)
         .fill(color)
-        .stroke(egui::Stroke::new(1.0, color))
+        .stroke(egui::Stroke::new(1.0_f32, color))
         .min_size(egui::vec2(82.0, 32.0));
     ui.add_enabled(false, button);
 }
