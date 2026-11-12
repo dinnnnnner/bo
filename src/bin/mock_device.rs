@@ -151,7 +151,7 @@ fn build_status_frame(frame_index: u64, device_idx: u64) -> [u8; STATUS_FRAME_LE
     frame[12..].copy_from_slice(&FRAME_TAIL);
 
     for idx in 0..9 {
-        frame[3 + idx] = if (frame_index + idx as u64 + device_idx * 2) % 7 == 0 {
+        frame[3 + idx] = if (frame_index + idx as u64 + device_idx * 2).is_multiple_of(7) {
             0x01
         } else {
             0x00
